@@ -1,0 +1,25 @@
+# Pinned to 2.2.0 (2026-06-17). On 1.17.x the Prometheus middleware is enabled by
+# default and binds an HTTP port per worker process, which is a nuisance at high
+# --processes counts. None of the 2.0.0 breaking changes touch the APIs used here.
+dramatiq[redis]==2.2.0
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+
+psycopg[binary,pool]==3.2.3
+pgvector==0.3.6
+redis==5.2.1
+
+httpx==0.28.1
+selectolax==0.3.27
+
+anthropic==0.40.0
+voyageai==0.3.2
+
+numpy==2.2.1
+boto3==1.35.90
+
+pytest==8.3.4
+pytest-asyncio==0.25.0
+respx==0.22.0
