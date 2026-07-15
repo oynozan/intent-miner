@@ -81,7 +81,7 @@ services:
   # from starving the LLM lanes, and lets each scale independently.
   worker-expand:
     build: .
-    command: dramatiq worker --processes 1 --threads 2 --queues expand
+    command: dramatiq worker worker --processes 1 --threads 2 --queues expand
     env_file: .env
     environment: &worker_env
       DATABASE_URL: postgresql://intent:intent@postgres:5432/intent_miner
@@ -97,7 +97,7 @@ services:
 
   worker-discover:
     build: .
-    command: dramatiq worker --processes 2 --threads 16 --queues discover
+    command: dramatiq worker worker --processes 2 --threads 16 --queues discover
     env_file: .env
     environment: *worker_env
     depends_on:
@@ -110,7 +110,7 @@ services:
 
   worker-fetch:
     build: .
-    command: dramatiq worker --processes 2 --threads 16 --queues fetch
+    command: dramatiq worker worker --processes 2 --threads 16 --queues fetch
     env_file: .env
     environment: *worker_env
     depends_on:
@@ -123,7 +123,7 @@ services:
 
   worker-score:
     build: .
-    command: dramatiq worker --processes 2 --threads 8 --queues score
+    command: dramatiq worker worker --processes 2 --threads 8 --queues score
     env_file: .env
     environment: *worker_env
     depends_on:
