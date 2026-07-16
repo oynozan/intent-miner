@@ -68,12 +68,9 @@ def start_run(run_id: str) -> None:
             leaf_rows.append((leaf_id, leaf["description"]))
             query_rows.extend(_compile_queries(run_id, leaf_id, leaf))
 
-    # Embed leaf descriptions -- the sufferer's phrasing of the pain, which is what the
-    # prefilter matches candidate posts against.
-    if leaf_rows:
-        vectors = embeddings.embed([d for _, d in leaf_rows], input_type="query")
-        repo.set_node_embeddings(zip((nid for nid, _ in leaf_rows), vectors))
-
+    # Leaf embedding is deliberately NOT done here. It happens in the prefilter, together
+    # with candidate embedding and locked to the same provider, so leaf and candidate
+    # vectors are guaranteed to share one space (see run_prefilter).
     query_ids = repo.insert_queries(query_rows)
     repo.merge_stats(run_id, {
         "leaves": len(leaf_rows),
@@ -390,8 +387,18 @@ def run_prefilter(run_id: str) -> None:
         finalize.send(run_id)
         return
 
-    vectors = embeddings.embed([c["body"] for c in candidates], input_type="document")
+    # Embed candidates and leaves here, in one place, locked to one provider. Candidates
+    # are the larger load, so they choose the provider (and fall back if the primary
+    # cannot serve them -- e.g. Voyage's free-tier rate limit on a big batch); leaves are
+    # then forced to that SAME provider. This guarantees leaf and candidate vectors share
+    # one space, which the cosine gate depends on. The old split (leaves embedded in
+    # expand, candidates here) let a mid-run Voyage->OpenAI fallback mix spaces and
+    # silently gut prefilter recall.
+    vectors, provider = embeddings.embed_with_provider([c["body"] for c in candidates], input_type="document")
+    leaf_vectors = embeddings.embed([leaf["description"] for leaf in leaf_rows], input_type="query", provider=provider)
     repo.save_candidate_embeddings(run_id, [(str(c["id"]), v) for c, v in zip(candidates, vectors)])
+    repo.set_node_embeddings((str(leaf["id"]), v) for leaf, v in zip(leaf_rows, leaf_vectors))
+    repo.merge_stats(run_id, {"embed_provider": provider})
 
     # Negative terms run before the cosine gate: they are a precision lever for
     # ambiguous pain phrases, and they are cheap.
@@ -409,7 +416,7 @@ def run_prefilter(run_id: str) -> None:
         return
 
     cand_matrix = np.asarray([vectors[i] for i in keep_idx], dtype=np.float32)
-    leaf_matrix = np.asarray([_parse_vec(leaf["embedding"]) for leaf in leaf_rows], dtype=np.float32)
+    leaf_matrix = np.asarray(leaf_vectors, dtype=np.float32)
 
     pairs = pf.select(cand_matrix, leaf_matrix, keep_percentile=_keep_percentile())
     rows = [
@@ -445,12 +452,6 @@ def _keep_percentile() -> float:
     with connection() as conn:
         row = conn.execute("SELECT keep_percentile FROM prefilter_config WHERE id = 1").fetchone()
     return float(row["keep_percentile"]) if row else 0.15
-
-
-def _parse_vec(value) -> list[float]:
-    if isinstance(value, str):
-        return [float(x) for x in value.strip("[]").split(",")]
-    return list(value)
 
 
 # --- 5. score ----------------------------------------------------------------------

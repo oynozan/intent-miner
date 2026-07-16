@@ -104,38 +104,71 @@ def _order() -> list[str]:
     return [primary] + [p for p in EMBED_PROVIDERS if p != primary]
 
 
-def embed(texts: Sequence[str], input_type: InputType = None, batch_size: int = 128) -> list[list[float]]:
-    """Embed texts, preserving input order, via the primary provider then the fallback.
+def embed(
+    texts: Sequence[str], input_type: InputType = None, batch_size: int = 128, provider: str | None = None
+) -> list[list[float]]:
+    """Embed texts, preserving input order.
 
     Order preservation is load-bearing: the prefilter zips these against candidate rows
     positionally, so a reordering silently attaches every score to the wrong post.
+
+    ``provider`` forces a single provider (no cross-space fallback) -- used to lock a
+    run's leaf and candidate embeddings to the same vector space. See
+    ``embed_with_provider``.
+    """
+    vectors, _ = embed_with_provider(texts, input_type, batch_size, provider)
+    return vectors
+
+
+def embed_with_provider(
+    texts: Sequence[str], input_type: InputType = None, batch_size: int = 128, provider: str | None = None
+) -> tuple[list[list[float]], str | None]:
+    """Embed and report which provider served it.
+
+    Without ``provider``: try the order (primary then fallback), first configured
+    success wins, and return the provider used so the caller can lock later calls to it.
+
+    With ``provider``: use ONLY that provider -- no fallback to a different vector space.
+    A run's leaf and candidate vectors must live in one space or the cosine gate is
+    meaningless (a Voyage-then-OpenAI mid-run switch silently corrupts the prefilter, all
+    the more likely on Voyage's free tier where a large candidate batch trips the rate
+    limit). So a forced provider that fails RAISES -- a clean failure the actor retries
+    is correct; garbage is not.
     """
     if not texts:
-        return []
+        return [], provider
     texts = list(texts)
-    order = _order()
 
-    attempted: list[str] = []
-    last_exc: Exception | None = None
-    for provider in order:
+    if provider is not None:
         if not _configured(provider):
-            log.info("embed: skipping %s (no api key)", provider)
-            continue
-        attempted.append(provider)
-        try:
-            out = _run(provider, texts, input_type, batch_size)
-        except Exception as exc:  # noqa: BLE001 -- any failure should try the fallback
-            last_exc = exc
-            log.warning("embed: provider %s failed (%s); trying next", provider, exc)
-            continue
-        if provider != order[0]:
-            log.warning("embed: served by fallback provider %s", provider)
+            raise RuntimeError(f"embedding provider {provider!r} is locked for this run but not configured")
+        out = _run(provider, texts, input_type, batch_size)
         if len(out) != len(texts):
             raise RuntimeError(f"embedding count mismatch: got {len(out)} for {len(texts)} inputs")
-        return out
+        return out, provider
+
+    order = _order()
+    attempted: list[str] = []
+    last_exc: Exception | None = None
+    for candidate in order:
+        if not _configured(candidate):
+            log.info("embed: skipping %s (no api key)", candidate)
+            continue
+        attempted.append(candidate)
+        try:
+            out = _run(candidate, texts, input_type, batch_size)
+        except Exception as exc:  # noqa: BLE001 -- any failure should try the fallback
+            last_exc = exc
+            log.warning("embed: provider %s failed (%s); trying next", candidate, exc)
+            continue
+        if candidate != order[0]:
+            log.warning("embed: served by fallback provider %s", candidate)
+        if len(out) != len(texts):
+            raise RuntimeError(f"embedding count mismatch: got {len(out)} for {len(texts)} inputs")
+        return out, candidate
 
     if not attempted:
         raise RuntimeError(
-            "no embedding provider configured -- set OPENAI_API_KEY (primary) or VOYAGE_API_KEY (fallback)"
+            "no embedding provider configured -- set VOYAGE_API_KEY (primary) or OPENAI_API_KEY (fallback)"
         )
     raise RuntimeError(f"all embedding providers failed {attempted}: {last_exc}")

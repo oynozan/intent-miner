@@ -53,12 +53,17 @@ gpt-5-nano is a reasoning model — its wiring (`max_completion_tokens`,
 Both embedding models emit 1024-dim vectors (Voyage's `output_dimension`, OpenAI's
 `dimensions`), so the `vector(1024)` schema fits either.
 
-> **Embedding caveat.** A run's leaf vectors and candidate vectors must come from the
-> *same* provider to be comparable. Both stages pick the first configured provider, so
-> they stay consistent — unless the primary succeeds for one stage and fails for the
-> other mid-run (e.g. an intermittent Voyage rate-limit), which would mix vector spaces
-> and produce a garbage prefilter. Rare, but if you see nonsense prefilter results with
-> both embedding keys set, that's the suspect.
+> **Embedding provider is locked per run.** A run's leaf and candidate vectors must
+> come from the *same* provider or the cosine gate is meaningless. The prefilter embeds
+> candidates first (the larger load, so they pick the provider — and fall back if the
+> primary can't serve them), then embeds leaves forced to that same provider. The run
+> records which one it used in `stats.embed_provider`.
+>
+> **Voyage's free tier is too small for candidate volume.** Without a payment method,
+> Voyage caps at 10K tokens/min — a batch of a few hundred candidates blows past it, so
+> in practice a Voyage-primary run falls back to OpenAI for embeddings (and locks leaves
+> to OpenAI too, consistently). Add a Voyage payment method (the 200M free tokens still
+> apply) or just set `EMBED_PROVIDER` so OpenAI is primary if you'd rather not fall back.
 
 Without a working provider a run reaches `status: expanding` and stops on
 `no LLM provider configured` (or the provider's own auth error). Everything up to that

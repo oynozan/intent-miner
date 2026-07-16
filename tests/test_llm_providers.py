@@ -138,3 +138,37 @@ def test_embeddings_fall_back_to_openai_when_voyage_unconfigured(monkeypatch: py
 
     assert embeddings.embed(["a", "b"]) == [[0.0], [0.0]]
     assert called == ["openai"], "with no Voyage key, embeddings must fall back to OpenAI"
+
+
+def test_embed_with_provider_reports_which_served(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The prefilter needs to know the provider so it can lock leaves to the same one."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-x")
+    monkeypatch.setenv("EMBED_PROVIDER", "voyage")
+    from llm import embeddings
+
+    monkeypatch.setattr(embeddings, "_voyage_embed", lambda t, i, b: [[1.0]] * len(t))
+    vecs, provider = embeddings.embed_with_provider(["a"], input_type="document")
+    assert provider == "voyage"
+    assert vecs == [[1.0]]
+
+
+def test_forced_provider_does_not_fall_back_to_a_different_space(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Locking to a provider must RAISE on failure, never silently switch vector spaces --
+    that is the whole point of the lock (leaf/candidate must share a space)."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-x")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    from llm import embeddings
+
+    monkeypatch.setattr(embeddings, "_voyage_embed", lambda *a: (_ for _ in ()).throw(RuntimeError("voyage rate limit")))
+    monkeypatch.setattr(embeddings, "_openai_embed", lambda *a: pytest.fail("must not fall back when a provider is forced"))
+
+    with pytest.raises(RuntimeError, match="voyage rate limit"):
+        embeddings.embed(["a"], provider="voyage")
+
+
+def test_forced_but_unconfigured_provider_raises_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    from llm import embeddings
+
+    with pytest.raises(RuntimeError, match="locked for this run but not configured"):
+        embeddings.embed(["a"], provider="voyage")
