@@ -35,22 +35,30 @@ docker compose up -d
 curl localhost:8001/health
 ```
 
-**Two keys are required; two are optional fallbacks. No offline mode.**
+**Three surfaces, each with a primary and an optional fallback. No offline mode.**
 
-| Key | Role | Used by | Notes |
+| Surface | Primary | Fallback | Flip with |
 |---|---|---|---|
-| `OPENAI_API_KEY` | **required** | LLM (gpt-5-nano) + embeddings (text-embedding-3-small) | primary for everything |
-| `SERPER_API_KEY` | **required** | discovery | ~$1/1k credits; `num > 10` bills **2** credits |
-| `ANTHROPIC_API_KEY` | optional | LLM fallback (Opus/Haiku) | used only if OpenAI errors or is unset |
-| `VOYAGE_API_KEY` | optional | embedding fallback (voyage-4-lite) | first 200M tokens free ≈ 200 runs |
+| **LLM** (expand + score) | `OPENAI_API_KEY` — gpt-5-nano | `ANTHROPIC_API_KEY` — Opus/Haiku | `LLM_PROVIDER=anthropic` |
+| **Embeddings** (prefilter) | `VOYAGE_API_KEY` — voyage-4-lite | `OPENAI_API_KEY` — text-embedding-3-small | `EMBED_PROVIDER=openai` |
+| **Discovery** (SERP) | `SERPER_API_KEY` — Serper | `SERPAPI_API_KEY` — SerpApi | `DISCOVERY_PROVIDER=serpapi` |
 
-**Provider order.** OpenAI is primary for both the LLM calls and embeddings; the
-pipeline transparently falls back to Anthropic (LLM) / Voyage (embeddings) if the
-primary errors or has no key. Set `LLM_PROVIDER=anthropic` to flip the LLM order.
+Each surface uses the primary and transparently falls through to the fallback if the
+primary errors or has no key. Minimum to run anything real: `OPENAI_API_KEY` (LLM) +
+`VOYAGE_API_KEY` or `OPENAI_API_KEY` (embeddings) + `SERPER_API_KEY` or `SERPAPI_API_KEY`
+(discovery). Voyage's first 200M embedding tokens are free (~200 runs).
+
 gpt-5-nano is a reasoning model — its wiring (`max_completion_tokens`,
-`reasoning_effort`, no `temperature`, strict `json_schema`) lives in `llm/providers.py`;
-gpt-5-nano can't embed, so embeddings use `text-embedding-3-small` reduced to 1024 dims
-via the `dimensions` param, which keeps the `vector(1024)` schema unchanged.
+`reasoning_effort`, no `temperature`, strict `json_schema`) lives in `llm/providers.py`.
+Both embedding models emit 1024-dim vectors (Voyage's `output_dimension`, OpenAI's
+`dimensions`), so the `vector(1024)` schema fits either.
+
+> **Embedding caveat.** A run's leaf vectors and candidate vectors must come from the
+> *same* provider to be comparable. Both stages pick the first configured provider, so
+> they stay consistent — unless the primary succeeds for one stage and fails for the
+> other mid-run (e.g. an intermittent Voyage rate-limit), which would mix vector spaces
+> and produce a garbage prefilter. Rare, but if you see nonsense prefilter results with
+> both embedding keys set, that's the suspect.
 
 Without a working provider a run reaches `status: expanding` and stops on
 `no LLM provider configured` (or the provider's own auth error). Everything up to that
@@ -152,7 +160,7 @@ same input, 3,000 survivors, 325 calls.
 ```
 api/          FastAPI surface
 core/         config, db, redis broker, barriers, rate limits, budget, url canonicalization
-discovery/    serper.py            (Exa declined; reddit_search deferred)
+discovery/    providers.py (Serper->SerpApi), serper.py, serpapi.py, common.py  (Exa declined)
 llm/          client.py, embeddings.py, prompts/{expand,score}.md
 pipeline/     actors.py, stages.py, prefilter.py, repo.py
 scrape/       quora.py, linkedin.py   (no browser.py -- there is no browser)

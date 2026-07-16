@@ -81,7 +81,7 @@ def _voyage_embed(texts: list[str], input_type: InputType, batch_size: int) -> l
 
 # Names in a stable list. Dispatch resolves the embedder from module globals at call
 # time (see _run) so a test can monkeypatch _openai_embed / _voyage_embed directly.
-EMBED_PROVIDERS = ("openai", "voyage")
+EMBED_PROVIDERS = ("voyage", "openai")
 
 
 def _run(provider: str, texts: list[str], input_type: InputType, batch_size: int) -> list[list[float]]:

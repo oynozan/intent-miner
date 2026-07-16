@@ -12,7 +12,7 @@ import pytest
 import respx
 
 from discovery import serper
-from discovery.serper import SerperError, SerperPermanentError
+from discovery.common import DiscoveryError, DiscoveryPermanentError
 
 
 @pytest.fixture(autouse=True)
@@ -30,44 +30,40 @@ ENDPOINT = "https://google.serper.dev/search"
 
 @respx.mock
 def test_403_unauthorized_is_permanent_with_the_real_message() -> None:
-    """The exact failure the user hit: an invalid key. Must be permanent, and must
-    carry Serper's own 'Unauthorized.' so the cause is obvious, not a generic 403."""
     respx.post(ENDPOINT).respond(403, json={"message": "Unauthorized.", "statusCode": 403})
-    with pytest.raises(SerperPermanentError) as exc:
+    with pytest.raises(DiscoveryPermanentError) as exc:
         serper.search("q", "quora")
     assert "Unauthorized." in str(exc.value)
     assert "403" in str(exc.value)
-    assert not isinstance(exc.value, SerperError), "must not be classified as retryable"
+    assert not isinstance(exc.value, DiscoveryError), "must not be classified as retryable"
 
 
 def test_missing_key_is_permanent_not_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A missing key will not appear on retry."""
     from core.config import settings
 
     monkeypatch.setenv("SERPER_API_KEY", "")
     settings.cache_clear()
-    with pytest.raises(SerperPermanentError, match="not set"):
+    with pytest.raises(DiscoveryPermanentError, match="not set"):
         serper.search("q", "quora")
 
 
 @respx.mock
 def test_429_rate_limit_is_retryable() -> None:
     respx.post(ENDPOINT).respond(429, json={"message": "Too many requests"})
-    with pytest.raises(SerperError) as exc:
+    with pytest.raises(DiscoveryError) as exc:
         serper.search("q", "quora")
-    assert not isinstance(exc.value, SerperPermanentError), "rate limit must stay retryable"
+    assert not isinstance(exc.value, DiscoveryPermanentError), "rate limit must stay retryable"
 
 
 @respx.mock
 def test_400_bad_request_is_permanent() -> None:
     respx.post(ENDPOINT).respond(400, json={"message": "Bad request"})
-    with pytest.raises(SerperPermanentError):
+    with pytest.raises(DiscoveryPermanentError):
         serper.search("q", "quora")
 
 
 @respx.mock
 def test_500_server_error_is_retryable() -> None:
-    """5xx is transient -- it must NOT be permanent, so the retry machinery gets it."""
     respx.post(ENDPOINT).respond(500, text="upstream error")
     with pytest.raises(httpx.HTTPStatusError):
         serper.search("q", "quora")
@@ -92,7 +88,6 @@ def test_200_parses_organic_results() -> None:
 
 @respx.mock
 def test_permanent_error_survives_a_non_json_body() -> None:
-    """Some 403s come back as HTML/plain text; _describe must not blow up on that."""
     respx.post(ENDPOINT).respond(403, text="<html>Forbidden</html>")
-    with pytest.raises(SerperPermanentError):
+    with pytest.raises(DiscoveryPermanentError):
         serper.search("q", "quora")

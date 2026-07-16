@@ -114,24 +114,27 @@ def test_all_providers_failing_surfaces_the_last_error(monkeypatch: pytest.Monke
         _call()
 
 
-# --- embeddings order (same shape, separate module) ---
+# --- embeddings order (same shape, separate module): Voyage primary, OpenAI fallback ---
 
-def test_embeddings_default_to_openai_primary(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("EMBED_PROVIDER", "openai")
+def test_embeddings_default_to_voyage_primary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("EMBED_PROVIDER", raising=False)  # exercise the default
+    from core.config import settings
+
+    settings.cache_clear()
     from llm import embeddings
 
-    assert embeddings._order()[0] == "openai"
+    assert embeddings._order()[0] == "voyage"
 
 
-def test_embeddings_fall_back_to_voyage(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setenv("VOYAGE_API_KEY", "pa-x")
-    monkeypatch.setenv("EMBED_PROVIDER", "openai")
+def test_embeddings_fall_back_to_openai_when_voyage_unconfigured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    monkeypatch.setenv("EMBED_PROVIDER", "voyage")
     from llm import embeddings
 
     called: list[str] = []
-    monkeypatch.setattr(embeddings, "_openai_embed", lambda *a: (_ for _ in ()).throw(AssertionError("no key")))
-    monkeypatch.setattr(embeddings, "_voyage_embed", lambda t, i, b: called.append("voyage") or [[0.0]] * len(t))
+    monkeypatch.setattr(embeddings, "_voyage_embed", lambda *a: (_ for _ in ()).throw(AssertionError("no key")))
+    monkeypatch.setattr(embeddings, "_openai_embed", lambda t, i, b: called.append("openai") or [[0.0]] * len(t))
 
     assert embeddings.embed(["a", "b"]) == [[0.0], [0.0]]
-    assert called == ["voyage"]
+    assert called == ["openai"], "with no Voyage key, embeddings must fall back to OpenAI"

@@ -12,7 +12,8 @@ import uuid
 import pytest
 from psycopg import OperationalError
 
-from discovery import serper
+from discovery import providers as discovery
+from discovery.common import DiscoveryError, DiscoveryPermanentError
 from pipeline import actors, repo
 
 
@@ -23,13 +24,14 @@ def _fake_query(qid: str) -> dict:
 
 
 def test_run_query_fast_fails_on_permanent_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 403/invalid-key must go straight to _fail_query -- no raise, so no retry storm."""
+    """When every discovery provider is permanently bad, go straight to _fail_query --
+    no raise, so no retry storm."""
     monkeypatch.setattr(repo, "get_query", _fake_query)
 
     def raise_permanent(*a, **k):
-        raise serper.SerperPermanentError("serper rejected the request -- 403: Unauthorized.")
+        raise DiscoveryPermanentError("all discovery providers failed -- 403: Unauthorized.")
 
-    monkeypatch.setattr(serper, "search", raise_permanent)
+    monkeypatch.setattr(discovery, "search", raise_permanent)
     calls: list[tuple] = []
     monkeypatch.setattr(actors, "_fail_query", lambda r, q, e: calls.append((r, q, e)))
 
@@ -55,12 +57,12 @@ def test_run_query_propagates_retryable_error(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(repo, "get_query", _fake_query)
 
     def raise_retryable(*a, **k):
-        raise serper.SerperError("serper rate limited")
+        raise DiscoveryError("all discovery providers failed (retryable)")
 
-    monkeypatch.setattr(serper, "search", raise_retryable)
+    monkeypatch.setattr(discovery, "search", raise_retryable)
     monkeypatch.setattr(actors, "_fail_query", lambda *a: pytest.fail("retryable error must not fast-fail"))
 
-    with pytest.raises(serper.SerperError):
+    with pytest.raises(DiscoveryError):
         actors.run_query.fn("run1", "q1")
 
 

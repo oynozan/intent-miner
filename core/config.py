@@ -34,6 +34,11 @@ class Settings:
     anthropic_api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
     voyage_api_key: str = field(default_factory=lambda: os.environ.get("VOYAGE_API_KEY", ""))
     serper_api_key: str = field(default_factory=lambda: os.environ.get("SERPER_API_KEY", ""))
+    serpapi_api_key: str = field(default_factory=lambda: os.environ.get("SERPAPI_API_KEY", ""))
+
+    # Discovery provider order. "serper" is primary; SerpApi is the fallback, tried
+    # only when Serper errors or has no key. Set DISCOVERY_PROVIDER=serpapi to flip.
+    discovery_provider: str = field(default_factory=lambda: os.environ.get("DISCOVERY_PROVIDER", "serper"))
 
     # LLM provider order. "openai" is primary; the other named provider is the
     # fallback, tried only when the primary errors or has no key. Set LLM_PROVIDER=
@@ -63,10 +68,13 @@ class Settings:
     score_model: str = field(default_factory=lambda: os.environ.get("SCORE_MODEL", "claude-haiku-4-5"))
 
     # --- Embeddings -----------------------------------------------------------
-    # OpenAI primary, Voyage fallback -- gpt-5-nano cannot embed, so "everything"
-    # here means text-embedding-3-small reduced to 1024 dims via the `dimensions`
-    # param, which keeps the vector(1024) schema. Voyage is the fallback.
-    embed_provider: str = field(default_factory=lambda: os.environ.get("EMBED_PROVIDER", "openai"))
+    # Voyage primary, OpenAI fallback. voyage-4-lite (output_dimension=1024) and
+    # text-embedding-3-small (dimensions=1024) both produce 1024-dim vectors, so the
+    # vector(1024) schema fits either. NOTE: a run's leaf vectors and candidate
+    # vectors must come from the SAME provider to be comparable -- both stages pick
+    # the first configured provider, so they stay consistent unless the primary
+    # fails intermittently between them (see llm/embeddings.py).
+    embed_provider: str = field(default_factory=lambda: os.environ.get("EMBED_PROVIDER", "voyage"))
     openai_embed_model: str = field(default_factory=lambda: os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
     embed_model: str = field(default_factory=lambda: os.environ.get("EMBED_MODEL", "voyage-4-lite"))
     # Passed explicitly on every call, both providers. OpenAI reduces to this via

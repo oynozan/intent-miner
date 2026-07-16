@@ -140,7 +140,7 @@ def run_query(run_id: str, query_id: str) -> None:
       never succeeds. This does NOT re-raise, so no retry and query_failed does not
       also fire -- _fail_query owns the barrier release either way.
     """
-    from discovery import serper
+    from discovery import providers as discovery
 
     query = repo.get_query(query_id)
     if query is None:
@@ -151,8 +151,11 @@ def run_query(run_id: str, query_id: str) -> None:
         return
 
     try:
-        results = serper.search(query["q"], query["platform"], depth=query["depth"])
-    except serper.SerperPermanentError as exc:
+        # Serper primary, SerpApi fallback -- see discovery/providers.py. A permanent
+        # error means every configured provider rejected the request (bad keys), so
+        # fail fast; retryable errors propagate to the retry middleware.
+        results = discovery.search(query["q"], query["platform"], depth=query["depth"])
+    except discovery.DiscoveryPermanentError as exc:
         _fail_query(run_id, query_id, str(exc))
         return
 
@@ -203,9 +206,9 @@ def query_failed(message: dict, retry_info: dict) -> None:
 def fan_out_fetch(run_id: str) -> None:
     repo.set_status(run_id, "fetching")
     candidates = repo.pending_candidates(run_id)
-    # Record how discovery went. If a bad Serper key failed every query, this is where
-    # candidates_discovered: 0 gets its explanation (queries_failed + a sample error)
-    # instead of leaving the user to dig through worker logs.
+    # Record how discovery went. If bad discovery keys (Serper and its SerpApi fallback)
+    # failed every query, this is where candidates_discovered: 0 gets its explanation
+    # (queries_failed + a sample error) instead of leaving the user to dig through logs.
     repo.merge_stats(run_id, {"candidates_discovered": len(candidates), **repo.query_counts(run_id)})
     fan_out(
         run_id, "fetch", [str(c["id"]) for c in candidates],
