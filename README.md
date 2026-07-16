@@ -9,6 +9,13 @@ GET  /runs/{id}/tree                            ->  the pain tree
 GET  /runs/{id}/results?node_id=&min_score=     ->  ranked links, grouped by leaf
 ```
 
+**Interactive API docs** (FastAPI, generated from the code): **Swagger UI** at
+[localhost:8001/docs](http://localhost:8001/docs), **ReDoc** at
+[localhost:8001/redoc](http://localhost:8001/redoc), raw **OpenAPI 3.1** spec at
+`/openapi.json`. The Swagger page documents the run lifecycle, every field, the
+`stats` keys, and what makes a post a lead vs. a gated-out ad — and lets you fire a
+`POST /runs` from the browser.
+
 ## The one idea
 
 **Do not search for your solution. Search for the pain.**

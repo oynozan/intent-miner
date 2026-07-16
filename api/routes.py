@@ -1,16 +1,39 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Path, Query
 
-from api.schemas import CreateRun, LeafResults, Node, Result, RunCreated, RunStatus
+from api.schemas import (
+    CreateRun,
+    ErrorDetail,
+    LeafResults,
+    Node,
+    Result,
+    RunCreated,
+    RunStatus,
+)
 from pipeline import repo
 
-router = APIRouter()
+router = APIRouter(tags=["runs"])
+
+_NOT_FOUND = {404: {"model": ErrorDetail, "description": "No run exists with that id."}}
+
+_RunId = Path(description="The run id returned by POST /runs.", examples=["ff95e261-9667-4451-a7bf-f01a97b2c544"])
 
 
-@router.post("/runs", response_model=RunCreated, status_code=202)
+@router.post(
+    "/runs",
+    response_model=RunCreated,
+    status_code=202,
+    summary="Start a run",
+    response_description="The run was accepted and is now processing asynchronously.",
+)
 def create_run(body: CreateRun) -> RunCreated:
-    """Start a run. Returns immediately; the pipeline is asynchronous."""
+    """Kick off a run and return its id immediately.
+
+    The response is **202 Accepted**, not 200: the pipeline (expand → discover → fetch
+    → prefilter → score) runs asynchronously in the workers. Poll `GET /runs/{run_id}`
+    to follow it, then read `GET /runs/{run_id}/results` once `status` is `done`.
+    """
     from pipeline.actors import start_run
 
     run_id = repo.create_run(body.input_text, body.icp)
@@ -18,8 +41,19 @@ def create_run(body: CreateRun) -> RunCreated:
     return RunCreated(run_id=run_id)
 
 
-@router.get("/runs/{run_id}", response_model=RunStatus)
-def get_run(run_id: str) -> RunStatus:
+@router.get(
+    "/runs/{run_id}",
+    response_model=RunStatus,
+    responses=_NOT_FOUND,
+    summary="Get run status and stats",
+)
+def get_run(run_id: str = _RunId) -> RunStatus:
+    """Current stage of the run plus its per-stage `stats`.
+
+    Poll this until `status` is `done` (or `failed`). `stats` grows as stages complete,
+    so it doubles as a live progress view -- e.g. `candidates_discovered` appears after
+    discovery, `kill_rate` after the prefilter, `leads` at the end.
+    """
     run = repo.get_run(run_id)
     if not run:
         raise HTTPException(404, "run not found")
@@ -32,8 +66,20 @@ def get_run(run_id: str) -> RunStatus:
     )
 
 
-@router.get("/runs/{run_id}/tree", response_model=list[Node])
-def get_tree(run_id: str) -> list[Node]:
+@router.get(
+    "/runs/{run_id}/tree",
+    response_model=list[Node],
+    responses=_NOT_FOUND,
+    summary="Get the pain tree",
+)
+def get_tree(run_id: str = _RunId) -> list[Node]:
+    """The tree the run expanded the solution into: root → branches (jobs-to-be-done) →
+    leaves (specific pains).
+
+    Available as soon as `expand` completes, before results exist. Useful for seeing how
+    the solution was translated into pain language, and for picking a `node_id` to filter
+    results by. Nodes are returned ordered by depth then label.
+    """
     if not repo.get_run(run_id):
         raise HTTPException(404, "run not found")
     return [
@@ -52,17 +98,35 @@ def get_tree(run_id: str) -> list[Node]:
     ]
 
 
-@router.get("/runs/{run_id}/results", response_model=list[LeafResults])
+@router.get(
+    "/runs/{run_id}/results",
+    response_model=list[LeafResults],
+    responses=_NOT_FOUND,
+    summary="Get ranked results, grouped by leaf",
+)
 def get_results(
-    run_id: str,
-    node_id: str | None = None,
-    min_score: float = Query(default=0.0, ge=0.0),
+    run_id: str = _RunId,
+    node_id: str | None = Query(
+        default=None,
+        description="Restrict to one leaf (a node id from GET /runs/{run_id}/tree). Omit for all leaves.",
+        examples=["3f2c1b90-1a2b-4c3d-9e8f-aabbccddeeff"],
+    ),
+    min_score: float = Query(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Minimum `final` score. Vendor posts and dead threads are gated to exactly "
+            "0.0, so a small positive value (e.g. 0.01) filters to genuine leads."
+        ),
+        examples=[0.01],
+    ),
 ) -> list[LeafResults]:
-    """Ranked links, grouped by leaf.
+    """Ranked links, grouped by leaf, strongest leaf first.
 
-    ``min_score`` defaults to 0.0 so nothing is hidden by default -- but note that
-    anything the scorer judged a vendor post or a dead thread already scores exactly
-    0.0, so `min_score` slightly above 0 is the useful filter.
+    Best read after `status` is `done`; on an in-progress run it returns whatever has
+    been scored so far. Each group is one pain (leaf); within a group, results are
+    ordered by `final` descending. See the `Result` schema for what makes a post a lead
+    versus a gated-out ad.
     """
     if not repo.get_run(run_id):
         raise HTTPException(404, "run not found")
