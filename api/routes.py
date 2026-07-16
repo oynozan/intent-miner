@@ -10,6 +10,7 @@ from api.schemas import (
     Result,
     RunCreated,
     RunStatus,
+    RunUrls,
 )
 from pipeline import repo
 
@@ -96,6 +97,39 @@ def get_tree(run_id: str = _RunId) -> list[Node]:
         )
         for n in repo.tree(run_id)
     ]
+
+
+@router.get(
+    "/runs/{run_id}/urls",
+    response_model=RunUrls,
+    responses=_NOT_FOUND,
+    summary="Get just the ranked result URLs, plus status",
+)
+def get_urls(
+    run_id: str = _RunId,
+    node_id: str | None = Query(
+        default=None, description="Restrict to one leaf (a node id from the tree). Omit for all leaves."
+    ),
+    min_score: float = Query(
+        default=0.0,
+        ge=0.0,
+        description="Minimum score. Ads and dead threads are gated to 0.0, so 0.01 returns genuine leads only.",
+        examples=[0.01],
+    ),
+) -> RunUrls:
+    """The minimal output: the run's `status` and a flat, de-duplicated, best-first
+    list of result URLs.
+
+    Poll `status` to know whether the list is final (`done`) or still filling in. A URL
+    that matched several leaves appears once, ranked by its strongest match.
+    """
+    run = repo.get_run(run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    return RunUrls(
+        status=run["status"],
+        urls=repo.result_urls(run_id, node_id=node_id, min_score=min_score),
+    )
 
 
 @router.get(

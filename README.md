@@ -7,6 +7,7 @@ POST /runs {"input_text": "...", "icp": "..."}  ->  {"run_id": "..."}
 GET  /runs/{id}                                 ->  status + stats
 GET  /runs/{id}/tree                            ->  the pain tree
 GET  /runs/{id}/results?node_id=&min_score=     ->  ranked links, grouped by leaf
+GET  /runs/{id}/urls?node_id=&min_score=        ->  {status, urls[]} — the flat list
 ```
 
 **Interactive API docs** (FastAPI, generated from the code): **Swagger UI** at

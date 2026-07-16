@@ -139,6 +139,29 @@ def mark_query(query_id: str, status: str, hits: int = 0, error: str | None = No
                      (status, hits, error, query_id))
 
 
+def query_counts(run_id: str) -> dict[str, Any]:
+    """Per-status query tallies plus one sample error, for run stats.
+
+    Surfacing this is how a bad Serper key stops being invisible: without it, the run
+    just shows candidates_discovered: 0 and the cause is buried in worker logs.
+    """
+    with connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) FILTER (WHERE status = 'ok') AS ok, "
+            "       count(*) FILTER (WHERE status = 'failed') AS failed, "
+            "       count(*) AS total, "
+            "       (SELECT error FROM queries WHERE run_id = %s AND status = 'failed' "
+            "        AND error IS NOT NULL LIMIT 1) AS sample_error "
+            "FROM queries WHERE run_id = %s",
+            (run_id, run_id),
+        ).fetchone()
+    return {
+        "queries_ok": row["ok"],
+        "queries_failed": row["failed"],
+        "query_error_sample": (row["sample_error"] or None) if row["failed"] else None,
+    }
+
+
 # --- candidates -------------------------------------------------------------------
 
 def upsert_candidate(
@@ -274,6 +297,27 @@ def results(run_id: str, node_id: str | None = None, min_score: float = 0.0) -> 
     sql += " ORDER BY s.final DESC"
     with connection() as conn:
         return conn.execute(sql, params).fetchall()
+
+
+def result_urls(run_id: str, node_id: str | None = None, min_score: float = 0.0) -> list[str]:
+    """Distinct result URLs, ranked by best score, for the flat /urls endpoint.
+
+    A single URL can match several leaves; here it appears once, ranked by its strongest
+    match (MAX(final)). Note that gated-out posts (vendor ads, dead threads) score
+    exactly 0.0, so a small positive min_score returns genuine leads only.
+    """
+    sql = (
+        "SELECT c.url, MAX(s.final) AS score "
+        "FROM scores s JOIN candidates c ON c.id = s.candidate_id "
+        "WHERE c.run_id = %s AND s.final >= %s"
+    )
+    params: list[Any] = [run_id, min_score]
+    if node_id:
+        sql += " AND s.node_id = %s"
+        params.append(node_id)
+    sql += " GROUP BY c.url ORDER BY score DESC"
+    with connection() as conn:
+        return [row["url"] for row in conn.execute(sql, params).fetchall()]
 
 
 def _vec(values: list[float]) -> str:

@@ -154,5 +154,27 @@ class LeafResults(BaseModel):
     results: list[Result]
 
 
+class RunUrls(BaseModel):
+    """Just the ranked result URLs plus the run's status.
+
+    The minimal shape for "give me the links": `status` tells you whether the run is
+    still working or `done`, and `urls` is the flat, de-duplicated, best-first list.
+    """
+
+    status: str = Field(
+        description=f"The run's current stage. One of: {RUN_STATUSES}.",
+        examples=["done"],
+    )
+    urls: list[str] = Field(
+        description="Distinct result URLs, ranked best-first. Partial while the run is still scoring.",
+        examples=[
+            [
+                "https://quora.com/how-do-i-remove-a-video-background-without-a-green-screen",
+                "https://linkedin.com/posts/someone_looking-for-a-tool-to-cut-out-video-activity-123",
+            ]
+        ],
+    )
+
+
 class ErrorDetail(BaseModel):
     detail: str = Field(examples=["run not found"])

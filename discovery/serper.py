@@ -49,7 +49,15 @@ class SerpResult:
 
 
 class SerperError(RuntimeError):
-    pass
+    """A retryable failure -- rate limit, 5xx, timeout. Propagate it so dramatiq retries."""
+
+
+class SerperPermanentError(RuntimeError):
+    """A non-retryable failure -- a bad key, forbidden, or malformed request.
+
+    Retrying a 403 four times per query never succeeds; it just floods the logs and
+    hides the real cause. The actor catches this and fails the query immediately.
+    """
 
 
 def build_query(q: str, platform: str, freshness_months: int | None = None) -> str:
@@ -67,15 +75,23 @@ def credits_for(depth: int) -> int:
 
 
 def search(q: str, platform: str, depth: int = 10, timeout: float = 10.0) -> list[SerpResult]:
-    """Run one SERP query. Raises on failure so dramatiq's retry middleware can act.
+    """Run one SERP query.
 
-    Deliberately does not catch exceptions: swallowing them here is what made the
-    spec's retries dead code. Let it propagate; the actor's on_retry_exhausted handles
-    the terminal case.
+    Error handling classifies by whether a retry could ever help:
+
+    * ``SerperPermanentError`` -- a missing/invalid key (403 "Unauthorized"), a
+      forbidden or malformed request. Retrying is pointless, so the actor fails the
+      query immediately rather than hammering the endpoint four times.
+    * ``SerperError`` and raw ``httpx`` errors -- rate limit (429), 5xx, timeouts.
+      These propagate so dramatiq's retry middleware can back off and try again.
+
+    Swallowing everything here is what made the spec's retries dead code; the fix is
+    to distinguish the two, not to catch nothing.
     """
     key = settings().serper_api_key
     if not key:
-        raise SerperError("SERPER_API_KEY is not set")
+        # A missing key will not appear on retry, so this is permanent, not retryable.
+        raise SerperPermanentError("SERPER_API_KEY is not set")
 
     query = build_query(q, platform, settings().freshness_months)
     response = httpx.post(
@@ -84,10 +100,28 @@ def search(q: str, platform: str, depth: int = 10, timeout: float = 10.0) -> lis
         json={"q": query, "num": depth},
         timeout=timeout,
     )
-    if response.status_code == 429:
-        raise SerperError("serper rate limited")
-    response.raise_for_status()
+
+    code = response.status_code
+    if code == 429:
+        raise SerperError(f"serper rate limited -- {_describe(response)}")  # retryable
+    if 400 <= code < 500:
+        # Every client error except the rate limit: bad key, forbidden, bad request.
+        # Surface Serper's own message so "403: Unauthorized." (invalid key) is obvious
+        # rather than buried under a generic "Client error 403".
+        raise SerperPermanentError(f"serper rejected the request -- {_describe(response)}")
+    response.raise_for_status()  # 5xx (and anything else) -> retryable HTTPStatusError
     return _parse(response.json())
+
+
+def _describe(response: httpx.Response) -> str:
+    """Serper's own error message, e.g. '403: Unauthorized.' or '403: Not enough credits'."""
+    message: Any
+    try:
+        body = response.json()
+        message = body.get("message") or body.get("error") or response.text
+    except Exception:
+        message = response.text
+    return f"{response.status_code}: {str(message)[:200]}"
 
 
 def _parse(payload: dict[str, Any]) -> list[SerpResult]:

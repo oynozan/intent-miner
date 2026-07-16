@@ -130,18 +130,31 @@ def _compile_queries(run_id: str, leaf_id: str, leaf: dict) -> list[dict]:
 def run_query(run_id: str, query_id: str) -> None:
     """Run one SERP query and insert its results as candidates.
 
-    No try/except: exceptions must propagate or the Retries middleware never fires.
-    No finally: arrival belongs to the success path only, with query_failed owning the
-    terminal-failure path. Exactly one of the two runs, exactly once.
+    Two failure paths, and exactly one fires per query:
+
+    * A retryable error (429, 5xx, timeout) propagates -- the Retries middleware backs
+      off and eventually hands the terminal case to query_failed. No try/except around
+      those, or retries become dead code.
+    * A permanent error (bad key, forbidden, malformed request) is caught here and the
+      query is failed immediately. Retrying a 403 four times just floods the logs and
+      never succeeds. This does NOT re-raise, so no retry and query_failed does not
+      also fire -- _fail_query owns the barrier release either way.
     """
     from discovery import serper
 
     query = repo.get_query(query_id)
     if query is None:
-        log.error("query %s vanished", query_id)
+        # A vanished query is still a barrier party. Returning without arriving would
+        # stall the discover barrier forever -- release the slot instead of hanging.
+        log.error("query %s vanished; releasing its barrier slot", query_id)
+        arrive(run_id, "discover", query_id, then=lambda: fan_out_fetch.send(run_id))
         return
 
-    results = serper.search(query["q"], query["platform"], depth=query["depth"])
+    try:
+        results = serper.search(query["q"], query["platform"], depth=query["depth"])
+    except serper.SerperPermanentError as exc:
+        _fail_query(run_id, query_id, str(exc))
+        return
 
     inserted = 0
     for result in results:
@@ -163,16 +176,25 @@ def run_query(run_id: str, query_id: str) -> None:
     arrive(run_id, "discover", query_id, then=lambda: fan_out_fetch.send(run_id))
 
 
+def _fail_query(run_id: str, query_id: str, error: str) -> None:
+    """Mark a query failed and release its barrier slot. The single terminal path.
+
+    Called from run_query's fast-fail (permanent errors) and from query_failed (retry
+    exhausted). Only one fires per query, and arrive() is idempotent regardless.
+    """
+    repo.mark_query(query_id, "failed", error=error[:500])
+    log.warning("run %s: query %s failed: %s", run_id, query_id, error[:200])
+    arrive(run_id, "discover", query_id, then=lambda: fan_out_fetch.send(run_id))
+
+
 @dramatiq.actor(queue_name="discover", max_retries=0)
 def query_failed(message: dict, retry_info: dict) -> None:
-    """Terminal failure for one query: record it, then release its slot in the barrier.
+    """Terminal path for a *retryable* query whose retries were exhausted.
 
-    A failed query degrades recall for one leaf. It must not hang the run.
+    A failed query degrades recall for one leaf; it must not hang the run.
     """
     run_id, query_id = message["args"][0], message["args"][1]
-    repo.mark_query(query_id, "failed", error=str(retry_info)[:500])
-    log.warning("run %s: query %s failed permanently", run_id, query_id)
-    arrive(run_id, "discover", query_id, then=lambda: fan_out_fetch.send(run_id))
+    _fail_query(run_id, query_id, str(retry_info))
 
 
 # --- 3. fetch ----------------------------------------------------------------------
@@ -181,7 +203,10 @@ def query_failed(message: dict, retry_info: dict) -> None:
 def fan_out_fetch(run_id: str) -> None:
     repo.set_status(run_id, "fetching")
     candidates = repo.pending_candidates(run_id)
-    repo.merge_stats(run_id, {"candidates_discovered": len(candidates)})
+    # Record how discovery went. If a bad Serper key failed every query, this is where
+    # candidates_discovered: 0 gets its explanation (queries_failed + a sample error)
+    # instead of leaving the user to dig through worker logs.
+    repo.merge_stats(run_id, {"candidates_discovered": len(candidates), **repo.query_counts(run_id)})
     fan_out(
         run_id, "fetch", [str(c["id"]) for c in candidates],
         send=lambda cid: fetch_candidate.send(run_id, cid),
