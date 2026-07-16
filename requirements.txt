@@ -22,9 +22,13 @@ httpx==0.28.1
 # handshake, so no proxy fixes what this fixes. LinkedIn does not need it.
 curl_cffi==0.15.0
 
-# 0.116.0: needs to be recent enough for adaptive thinking + output_config
-# (structured outputs). Do not downgrade without re-reading llm/client.py.
+# Primary LLM + embedding provider. 2.45.0 supports gpt-5-nano's reasoning params
+# (max_completion_tokens, reasoning_effort) and strict json_schema structured output.
+openai==2.45.0
+# Fallback LLM. 0.116.0: recent enough for adaptive thinking + output_config
+# (structured outputs). Do not downgrade without re-reading llm/providers.py.
 anthropic==0.116.0
+# Fallback embeddings.
 voyageai==0.5.0
 
 numpy==2.5.1

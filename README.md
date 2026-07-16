@@ -27,16 +27,26 @@ docker compose up -d
 curl localhost:8001/health
 ```
 
-**Three keys are required and there is no offline mode:**
+**Two keys are required; two are optional fallbacks. No offline mode.**
 
-| Key | Used by | Notes |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | expand_tree (Opus 4.8), score_batch (Haiku 4.5) | |
-| `VOYAGE_API_KEY` | prefilter embeddings | first 200M tokens free ≈ 200 runs |
-| `SERPER_API_KEY` | discovery | ~$1/1k credits; `num > 10` bills **2** credits |
+| Key | Role | Used by | Notes |
+|---|---|---|---|
+| `OPENAI_API_KEY` | **required** | LLM (gpt-5-nano) + embeddings (text-embedding-3-small) | primary for everything |
+| `SERPER_API_KEY` | **required** | discovery | ~$1/1k credits; `num > 10` bills **2** credits |
+| `ANTHROPIC_API_KEY` | optional | LLM fallback (Opus/Haiku) | used only if OpenAI errors or is unset |
+| `VOYAGE_API_KEY` | optional | embedding fallback (voyage-4-lite) | first 200M tokens free ≈ 200 runs |
 
-Without them a run reaches `status: expanding` and stops on
-`Could not resolve authentication method`. Everything up to that point is verified working.
+**Provider order.** OpenAI is primary for both the LLM calls and embeddings; the
+pipeline transparently falls back to Anthropic (LLM) / Voyage (embeddings) if the
+primary errors or has no key. Set `LLM_PROVIDER=anthropic` to flip the LLM order.
+gpt-5-nano is a reasoning model — its wiring (`max_completion_tokens`,
+`reasoning_effort`, no `temperature`, strict `json_schema`) lives in `llm/providers.py`;
+gpt-5-nano can't embed, so embeddings use `text-embedding-3-small` reduced to 1024 dims
+via the `dimensions` param, which keeps the `vector(1024)` schema unchanged.
+
+Without a working provider a run reaches `status: expanding` and stops on
+`no LLM provider configured` (or the provider's own auth error). Everything up to that
+point is verified working.
 
 Host ports are offset (API **8001**, Postgres 5432, Redis **6380**, MinIO **9002/9003**)
 so this stack can run alongside the sibling `bg-remover` stack, which binds 6379 and 9000.

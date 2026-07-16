@@ -1,43 +1,28 @@
-"""Anthropic client and the two schema'd calls the pipeline makes.
+"""The two schema'd LLM calls the pipeline makes.
 
-Model choice is deliberate and asymmetric:
+Both go through ``llm.providers``, which runs OpenAI (gpt-5-nano) as primary and falls
+back to Anthropic. The schemas here are strict: every property is required and every
+object sets ``additionalProperties: false``. That is not Anthropic-specific -- OpenAI's
+strict structured-output mode requires exactly the same, so one schema serves both.
 
-* ``expand_tree`` uses Opus. It runs once per run and its output is the only thing
-  every later stage can filter -- a bad pain translation cannot be recovered by any
-  amount of downstream cleverness. This is the one place a frontier model pays for
-  itself on a per-run basis (~$0.26).
-* ``score_batch`` uses Haiku across ~30-45 calls. Cheap, but the plan requires baking
-  it off against Sonnet on labelled data before trusting it: pain-vs-mention and
-  genuine-asker-vs-vendor are exactly the judgement calls a small model fumbles.
-
-Both use ``output_config.format`` (structured outputs) rather than prompt-begging for
-JSON. Assistant prefill -- the old way to force a JSON shape -- returns 400 on Opus 4.8
-and Haiku 4.5, so it is not an option even as a fallback.
+Per-provider model/effort/token choices live in ``core.config`` and are threaded
+through ``params`` below. Note the two tasks are asymmetric in what they need: expand
+runs once and its tree is the only thing every later stage can filter, so it gets the
+higher effort and token budget; score runs ~30 times per run on a cheaper setting.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
-import anthropic
-
 from core.config import settings
+from llm import providers
 
 log = logging.getLogger(__name__)
 
 PROMPTS = Path(__file__).parent / "prompts"
-
-_client: anthropic.Anthropic | None = None
-
-
-def client() -> anthropic.Anthropic:
-    global _client
-    if _client is None:
-        _client = anthropic.Anthropic(api_key=settings().anthropic_api_key or None)
-    return _client
 
 
 def prompt(name: str) -> str:
@@ -101,23 +86,26 @@ TREE_SCHEMA = {
 
 
 def expand_tree(input_text: str, icp: str | None = None) -> dict[str, Any]:
-    """One Opus call: product description -> tree of pains in the sufferer's words."""
+    """One LLM call: product description -> tree of pains in the sufferer's words."""
+    s = settings()
     user = f"<solution>\n{input_text.strip()}\n</solution>"
     if icp:
         user += f"\n\n<icp>\n{icp.strip()}\n</icp>"
 
-    response = client().messages.create(
-        model=settings().expand_model,
-        max_tokens=16_000,
+    return providers.complete_json(
         system=prompt("expand"),
-        thinking={"type": "adaptive"},
-        output_config={"effort": "high", "format": {"type": "json_schema", "schema": TREE_SCHEMA}},
-        messages=[{"role": "user", "content": user}],
+        user=user,
+        schema=TREE_SCHEMA,
+        schema_name="pain_tree",
+        params={
+            "openai": {
+                "model": s.openai_expand_model,
+                "effort": s.openai_expand_effort,
+                "max_tokens": s.openai_expand_max_tokens,
+            },
+            "anthropic": {"model": s.expand_model, "effort": "high", "max_tokens": 16_000},
+        },
     )
-    if response.stop_reason == "refusal":
-        raise RuntimeError(f"expand_tree refused: {response.stop_details}")
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)
 
 
 # --- score_batch ------------------------------------------------------------------
@@ -152,21 +140,20 @@ SCORE_SCHEMA = {
 
 
 def score_batch(pairs_payload: str) -> list[dict[str, Any]]:
-    """Score up to ~10 candidate/leaf pairs in one call.
-
-    No prompt caching here on purpose: the rubric is ~800 tokens, well under the
-    4,096-token minimum cacheable prefix for Haiku 4.5. Adding cache_control would
-    silently no-op (cache_creation_input_tokens: 0, no error) and mislead anyone
-    reading the code into thinking caching was handled.
-    """
-    response = client().messages.create(
-        model=settings().score_model,
-        max_tokens=8_000,
+    """Score up to ~10 candidate/leaf pairs in one call."""
+    s = settings()
+    result = providers.complete_json(
         system=prompt("score"),
-        output_config={"format": {"type": "json_schema", "schema": SCORE_SCHEMA}},
-        messages=[{"role": "user", "content": pairs_payload}],
+        user=pairs_payload,
+        schema=SCORE_SCHEMA,
+        schema_name="pair_scores",
+        params={
+            "openai": {
+                "model": s.openai_score_model,
+                "effort": s.openai_score_effort,
+                "max_tokens": s.openai_score_max_tokens,
+            },
+            "anthropic": {"model": s.score_model, "effort": "medium", "max_tokens": 8_000},
+        },
     )
-    if response.stop_reason == "refusal":
-        raise RuntimeError(f"score_batch refused: {response.stop_details}")
-    text = next(b.text for b in response.content if b.type == "text")
-    return json.loads(text)["results"]
+    return result["results"]

@@ -1,22 +1,19 @@
-"""Voyage embeddings.
+"""Embeddings, with primary -> fallback like the LLM calls.
 
-voyage-4-lite @ 1024 dims. Two things about this are not defaults and must not be
-allowed to become implicit:
+OpenAI (text-embedding-3-small) is primary; Voyage (voyage-4-lite) is the fallback.
+gpt-5-nano cannot embed, so "OpenAI for everything" means the embedding model here,
+reduced to 1024 dims via OpenAI's ``dimensions`` param -- which keeps the vector(1024)
+schema unchanged.
 
-* **output_dimension is passed explicitly, always.** The Voyage 4 family supports
-  256/512/1024/2048. The API defaults to 1024 but the HuggingFace weights default to
-  2048 -- so an implicit default means a local dev path and the API path can silently
-  produce vectors that do not share a space. The failure is not an error; it is
-  quietly meaningless cosine values.
-* **1536 does not exist here.** The original spec's ``vector(1536)`` was an OpenAI
-  ada-002/3-small leftover. There is no 1536 option in this family.
+``output_dimension`` / ``dimensions`` is passed explicitly on every call, both
+providers. OpenAI reduces to it; Voyage's HF weights default to 2048 while its API
+defaults to 1024. An implicit default lets dev and prod produce vectors that do not
+share a space -- silent, just meaningless cosines.
 
-``input_type`` is a genuine open question, not a settled default. Voyage's FAQ says
-"do not omit input_type", but that guidance is scoped to retrieval/RAG, and their own
-model cards use an identical prompt on both sides for STS-style symmetric tasks. Our
-task -- a pain description against a forum post -- is arguably symmetric (two pain
-descriptions) rather than query/document. It is configurable so the calibration sweep
-can settle it with measured recall instead of an assumption.
+``input_type`` (query vs document) is a Voyage concept; OpenAI text-embedding-3 has no
+such distinction and ignores it. The prefilter normalizes vectors regardless of
+provider, so the two are interchangeable at the cosine level even though only Voyage's
+arm of the calibration sweep can vary ``input_type``.
 """
 
 from __future__ import annotations
@@ -30,38 +27,115 @@ log = logging.getLogger(__name__)
 
 InputType = Literal["query", "document"] | None
 
-_client = None
+_openai_client = None
+_voyage_client = None
 
 
-def client():
-    global _client
-    if _client is None:
+def _openai():
+    global _openai_client
+    if _openai_client is None:
+        from openai import OpenAI
+
+        _openai_client = OpenAI(api_key=settings().openai_api_key or None)
+    return _openai_client
+
+
+def _voyage():
+    global _voyage_client
+    if _voyage_client is None:
         import voyageai
 
-        _client = voyageai.Client(api_key=settings().voyage_api_key or None)
-    return _client
+        _voyage_client = voyageai.Client(api_key=settings().voyage_api_key or None)
+    return _voyage_client
 
 
-def embed(texts: Sequence[str], input_type: InputType = None, batch_size: int = 128) -> list[list[float]]:
-    """Embed texts, preserving input order.
-
-    Order preservation is load-bearing: the prefilter zips these against candidate rows
-    positionally, so a reordering would silently attach every score to the wrong post.
-    """
-    if not texts:
-        return []
-
+def _openai_embed(texts: list[str], input_type: InputType, batch_size: int) -> list[list[float]]:
     out: list[list[float]] = []
     for start in range(0, len(texts), batch_size):
-        chunk = list(texts[start : start + batch_size])
-        result = client().embed(
+        chunk = texts[start : start + batch_size]
+        result = _openai().embeddings.create(
+            model=settings().openai_embed_model,
+            input=chunk,
+            dimensions=settings().embed_dimension,  # never implicit -- see module docstring
+        )
+        # Sort by index: the API returns objects carrying their input position, and
+        # relying on incidental ordering would silently misalign vectors to rows.
+        for item in sorted(result.data, key=lambda d: d.index):
+            out.append(item.embedding)
+    return out
+
+
+def _voyage_embed(texts: list[str], input_type: InputType, batch_size: int) -> list[list[float]]:
+    out: list[list[float]] = []
+    for start in range(0, len(texts), batch_size):
+        chunk = texts[start : start + batch_size]
+        result = _voyage().embed(
             chunk,
             model=settings().embed_model,
             input_type=input_type,
-            output_dimension=settings().embed_dimension,  # never implicit -- see module docstring
+            output_dimension=settings().embed_dimension,
         )
         out.extend(result.embeddings)
-
-    if len(out) != len(texts):
-        raise RuntimeError(f"embedding count mismatch: got {len(out)} for {len(texts)} inputs")
     return out
+
+
+# Names in a stable list. Dispatch resolves the embedder from module globals at call
+# time (see _run) so a test can monkeypatch _openai_embed / _voyage_embed directly.
+EMBED_PROVIDERS = ("openai", "voyage")
+
+
+def _run(provider: str, texts: list[str], input_type: InputType, batch_size: int) -> list[list[float]]:
+    return {"openai": _openai_embed, "voyage": _voyage_embed}[provider](texts, input_type, batch_size)
+
+
+def _configured(provider: str) -> bool:
+    s = settings()
+    if provider == "openai":
+        return bool(s.openai_api_key)
+    if provider == "voyage":
+        return bool(s.voyage_api_key)
+    return False
+
+
+def _order() -> list[str]:
+    primary = settings().embed_provider
+    if primary not in EMBED_PROVIDERS:
+        primary = "openai"
+    return [primary] + [p for p in EMBED_PROVIDERS if p != primary]
+
+
+def embed(texts: Sequence[str], input_type: InputType = None, batch_size: int = 128) -> list[list[float]]:
+    """Embed texts, preserving input order, via the primary provider then the fallback.
+
+    Order preservation is load-bearing: the prefilter zips these against candidate rows
+    positionally, so a reordering silently attaches every score to the wrong post.
+    """
+    if not texts:
+        return []
+    texts = list(texts)
+    order = _order()
+
+    attempted: list[str] = []
+    last_exc: Exception | None = None
+    for provider in order:
+        if not _configured(provider):
+            log.info("embed: skipping %s (no api key)", provider)
+            continue
+        attempted.append(provider)
+        try:
+            out = _run(provider, texts, input_type, batch_size)
+        except Exception as exc:  # noqa: BLE001 -- any failure should try the fallback
+            last_exc = exc
+            log.warning("embed: provider %s failed (%s); trying next", provider, exc)
+            continue
+        if provider != order[0]:
+            log.warning("embed: served by fallback provider %s", provider)
+        if len(out) != len(texts):
+            raise RuntimeError(f"embedding count mismatch: got {len(out)} for {len(texts)} inputs")
+        return out
+
+    if not attempted:
+        raise RuntimeError(
+            "no embedding provider configured -- set OPENAI_API_KEY (primary) or VOYAGE_API_KEY (fallback)"
+        )
+    raise RuntimeError(f"all embedding providers failed {attempted}: {last_exc}")

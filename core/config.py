@@ -30,21 +30,49 @@ class Settings:
     s3_access_key: str = field(default_factory=lambda: _env("S3_ACCESS_KEY", "minioadmin"))
     s3_secret_key: str = field(default_factory=lambda: _env("S3_SECRET_KEY", "minioadmin"))
 
+    openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
     anthropic_api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
     voyage_api_key: str = field(default_factory=lambda: os.environ.get("VOYAGE_API_KEY", ""))
     serper_api_key: str = field(default_factory=lambda: os.environ.get("SERPER_API_KEY", ""))
 
-    # Opus for the tree: it is the one call where a big model changes the product,
-    # because a bad pain translation cannot be recovered downstream. Haiku for
-    # scoring: 45ish calls per run, and the plan is to bake it off against Sonnet 5
-    # on labelled data before trusting it.
+    # LLM provider order. "openai" is primary; the other named provider is the
+    # fallback, tried only when the primary errors or has no key. Set LLM_PROVIDER=
+    # anthropic to flip the order.
+    llm_provider: str = field(default_factory=lambda: os.environ.get("LLM_PROVIDER", "openai"))
+
+    # --- OpenAI (primary) -----------------------------------------------------
+    # gpt-5-nano for both tasks, per request ("for everything"). Separable so a
+    # bigger OpenAI model can be dropped into expand -- the one call where model
+    # quality changes the product -- without touching code.
+    #
+    # gpt-5-nano is a reasoning model: the token cap is max_completion_tokens (which
+    # also covers reasoning tokens), depth is reasoning_effort (low|medium|high), and
+    # temperature/top_p are rejected. Expand gets a generous cap because reasoning
+    # tokens eat into it before the tree is emitted.
+    openai_expand_model: str = field(default_factory=lambda: os.environ.get("OPENAI_EXPAND_MODEL", "gpt-5-nano"))
+    openai_score_model: str = field(default_factory=lambda: os.environ.get("OPENAI_SCORE_MODEL", "gpt-5-nano"))
+    openai_expand_effort: str = field(default_factory=lambda: os.environ.get("OPENAI_EXPAND_EFFORT", "high"))
+    openai_score_effort: str = field(default_factory=lambda: os.environ.get("OPENAI_SCORE_EFFORT", "low"))
+    openai_expand_max_tokens: int = field(default_factory=lambda: int(os.environ.get("OPENAI_EXPAND_MAX_TOKENS", "24000")))
+    openai_score_max_tokens: int = field(default_factory=lambda: int(os.environ.get("OPENAI_SCORE_MAX_TOKENS", "8000")))
+
+    # --- Anthropic (fallback) -------------------------------------------------
+    # Reached only when OpenAI is down or unset. Opus for the tree (the one call a
+    # big model earns its cost on), Haiku for scoring.
     expand_model: str = field(default_factory=lambda: os.environ.get("EXPAND_MODEL", "claude-opus-4-8"))
     score_model: str = field(default_factory=lambda: os.environ.get("SCORE_MODEL", "claude-haiku-4-5"))
 
+    # --- Embeddings -----------------------------------------------------------
+    # OpenAI primary, Voyage fallback -- gpt-5-nano cannot embed, so "everything"
+    # here means text-embedding-3-small reduced to 1024 dims via the `dimensions`
+    # param, which keeps the vector(1024) schema. Voyage is the fallback.
+    embed_provider: str = field(default_factory=lambda: os.environ.get("EMBED_PROVIDER", "openai"))
+    openai_embed_model: str = field(default_factory=lambda: os.environ.get("OPENAI_EMBED_MODEL", "text-embedding-3-small"))
     embed_model: str = field(default_factory=lambda: os.environ.get("EMBED_MODEL", "voyage-4-lite"))
-    # Must be passed explicitly on every call: the HuggingFace weights default to
-    # 2048 while the API defaults to 1024, so an implicit default means dev and prod
-    # can silently produce vectors that do not share a space.
+    # Passed explicitly on every call, both providers. OpenAI reduces to this via
+    # `dimensions`; Voyage's HF weights default to 2048 while its API defaults to
+    # 1024, so an implicit default lets dev and prod produce vectors that do not
+    # share a space -- a silent failure, just meaningless cosines.
     embed_dimension: int = field(default_factory=lambda: int(os.environ.get("EMBED_DIMENSION", "1024")))
 
     # Hard per-run ceiling on discovery spend. A runaway tree or a retry storm is
