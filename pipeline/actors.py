@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 import dramatiq
 import numpy as np
 
-from core.broker import broker  # noqa: F401  -- import for the side effect: sets the global broker
+from core.broker import broker, redis_client  # noqa: F401  -- broker import sets the global broker
 from core.config import settings
 from core.urls import NotCanonicalizable, canonicalize, platform_of, url_hash
 from llm import client as llm
@@ -210,29 +210,83 @@ def fan_out_fetch(run_id: str) -> None:
     # failed every query, this is where candidates_discovered: 0 gets its explanation
     # (queries_failed + a sample error) instead of leaving the user to dig through logs.
     repo.merge_stats(run_id, {"candidates_discovered": len(candidates), **repo.query_counts(run_id)})
+
+    # Route by platform. LinkedIn goes to its own low-concurrency queue: LinkedIn
+    # throttles an IP under crawl volume, and the shared `fetch` queue (2 x 16 threads)
+    # fires it too fast -- a whole run's LinkedIn candidates came back as gated 200s with
+    # no post body. Quora is fine at high concurrency (curl_cffi handles its gate).
+    platform_by_id = {str(c["id"]): c["platform"] for c in candidates}
+
+    def _send(cid: str) -> None:
+        if platform_by_id.get(cid) == "linkedin":
+            fetch_linkedin_candidate.send(run_id, cid)
+        else:
+            fetch_candidate.send(run_id, cid)
+
     fan_out(
         run_id, "fetch", [str(c["id"]) for c in candidates],
-        send=lambda cid: fetch_candidate.send(run_id, cid),
+        send=_send,
         on_empty=lambda: run_prefilter.send(run_id),
     )
 
 
+def _arrive_fetch(run_id: str, candidate_id: str) -> None:
+    """Shared barrier arrival for both fetch queues. The fetch barrier holds every
+    candidate id regardless of which queue processed it."""
+    arrive(run_id, "fetch", candidate_id, then=lambda: run_prefilter.send(run_id))
+
+
 @dramatiq.actor(queue_name="fetch", max_retries=3, on_retry_exhausted="fetch_failed", time_limit=120_000)
 def fetch_candidate(run_id: str, candidate_id: str) -> None:
-    """Fetch and parse one candidate. Plain HTTP -- there is no browser in this pipeline."""
+    """Fetch a non-LinkedIn candidate (Quora). Plain HTTP -- no browser in this pipeline."""
     candidate = repo.get_candidate(candidate_id)
     if candidate is None:
+        _arrive_fetch(run_id, candidate_id)  # vanished, but still a barrier party
         return
 
     if candidate["platform"] == "quora":
         _fetch_quora(candidate_id, candidate["url"])
-    elif candidate["platform"] == "linkedin":
-        _fetch_linkedin(candidate_id, candidate["url"])
     else:
         repo.save_fetched(candidate_id, None, None, None, 0, None, "skipped",
                           error=f"no fetcher for {candidate['platform']}")
 
-    arrive(run_id, "fetch", candidate_id, then=lambda: run_prefilter.send(run_id))
+    _arrive_fetch(run_id, candidate_id)
+
+
+@dramatiq.actor(queue_name="fetch_linkedin", max_retries=3, on_retry_exhausted="fetch_failed", time_limit=120_000)
+def fetch_linkedin_candidate(run_id: str, candidate_id: str) -> None:
+    """Fetch one LinkedIn post on the dedicated low-concurrency queue.
+
+    Retries a *throttled* response (a gated 200 with no post data) so it recovers as the
+    burst subsides, but records a genuinely text-less post as terminal. A per-run circuit
+    breaker stops LinkedIn fetching entirely once throttling is clearly persistent.
+    """
+    candidate = repo.get_candidate(candidate_id)
+    if candidate is None:
+        _arrive_fetch(run_id, candidate_id)
+        return
+    _fetch_linkedin(run_id, candidate_id, candidate["url"])
+    _arrive_fetch(run_id, candidate_id)
+
+
+# --- LinkedIn throttle circuit breaker (per run, in Redis) -------------------------
+
+def _linkedin_breaker_key(run_id: str) -> str:
+    return f"linkedin_throttle:{run_id}"
+
+
+def _linkedin_breaker_tripped(run_id: str) -> bool:
+    count = redis_client.get(_linkedin_breaker_key(run_id))
+    return count is not None and int(count) >= settings().linkedin_throttle_breaker
+
+
+def _bump_linkedin_throttle(run_id: str) -> int:
+    key = _linkedin_breaker_key(run_id)
+    with redis_client.pipeline() as pipe:
+        pipe.incr(key)
+        pipe.expire(key, 3600)
+        count, _ = pipe.execute()
+    return int(count)
 
 
 def _fetch_quora(candidate_id: str, url: str) -> None:
@@ -263,18 +317,39 @@ def _fetch_quora(candidate_id: str, url: str) -> None:
     )
 
 
-def _fetch_linkedin(candidate_id: str, url: str) -> None:
+def _fetch_linkedin(run_id: str, candidate_id: str, url: str) -> None:
+    import random
+    import time
+
     from scrape import linkedin
+
+    # Circuit breaker: once throttling is clearly persistent for this run, stop fetching
+    # LinkedIn rather than hammering a throttled IP for every remaining candidate.
+    if _linkedin_breaker_tripped(run_id):
+        repo.save_fetched(candidate_id, None, None, None, 0, None, "skipped",
+                          error="linkedin throttled (circuit breaker open)")
+        return
+
+    # Pace even the low-concurrency queue so it never becomes a tight burst.
+    jitter = settings().linkedin_fetch_jitter_ms
+    if jitter > 0:
+        time.sleep(random.uniform(0, jitter / 1000))
 
     status, html, _headers, final_url = linkedin.fetch(url)
     if linkedin.is_authwalled(status, final_url, html):
-        # 999 is LinkedIn's verdict on the caller, not the request. Raising lets the
-        # retry middleware back off; if it persists, fetch_failed records it and the
-        # authwall rate in stats is the signal to stop.
+        # 999 / auth-wall redirect: LinkedIn's verdict on the caller. Count it toward the
+        # breaker and raise so the retry middleware backs off.
+        _bump_linkedin_throttle(run_id)
         raise RuntimeError(f"linkedin authwall ({status}) for {url}")
 
     post = linkedin.parse(html, url)
     if not post.body:
+        if post.looks_throttled:
+            # 200 with no post ld+json node -> a gated/throttled page, not the post.
+            # Count it and raise so it retries as the burst subsides; genuinely text-less
+            # posts (posting node present, empty body) fall through to a terminal "empty".
+            count = _bump_linkedin_throttle(run_id)
+            raise RuntimeError(f"linkedin throttled (gated 200, breaker {count}) for {url}")
         repo.save_fetched(candidate_id, None, None, None, 0, None, "empty")
         return
 

@@ -95,6 +95,15 @@ class Settings:
 
     recency_half_life_days: float = field(default_factory=lambda: float(os.environ.get("RECENCY_HALF_LIFE_DAYS", "180")))
 
+    # LinkedIn throttles a single IP under crawl volume, serving login-gated 200s with no
+    # post data. Two levers keep fetches under its radar: LinkedIn runs on a dedicated
+    # low-concurrency queue (see docker-compose worker-fetch-linkedin), and each fetch
+    # waits a random 0..jitter_ms first so even that low concurrency does not become a
+    # tight burst. If throttling still trips this many times in a run, the circuit
+    # breaker skips the rest rather than hammering a throttled IP for the whole run.
+    linkedin_fetch_jitter_ms: int = field(default_factory=lambda: int(os.environ.get("LINKEDIN_FETCH_JITTER_MS", "500")))
+    linkedin_throttle_breaker: int = field(default_factory=lambda: int(os.environ.get("LINKEDIN_THROTTLE_BREAKER", "20")))
+
 
 @lru_cache(maxsize=1)
 def settings() -> Settings:

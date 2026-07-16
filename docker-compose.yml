@@ -121,6 +121,23 @@ services:
     volumes:
       - .:/app
 
+  # LinkedIn on its own low-concurrency queue. LinkedIn throttles an IP under crawl
+  # volume (a full run's LinkedIn candidates came back as gated 200s with no body), so
+  # it must be paced -- 2 concurrent, plus per-fetch jitter, keeps it under the radar.
+  # Quora stays on the fast `fetch` queue above.
+  worker-fetch-linkedin:
+    build: .
+    command: dramatiq worker worker --processes 1 --threads 2 --queues fetch_linkedin
+    env_file: .env
+    environment: *worker_env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/app
+
   worker-score:
     build: .
     command: dramatiq worker worker --processes 2 --threads 8 --queues score

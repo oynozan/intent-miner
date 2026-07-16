@@ -78,6 +78,36 @@ def test_empty_page_yields_no_body_rather_than_empty_string() -> None:
     assert post.source is None
 
 
+# --- throttle vs genuinely-empty (the "why no LinkedIn links" fix) ---
+
+def test_real_post_is_not_throttled(post: LinkedInPost) -> None:
+    """A real post page carries a SocialMediaPosting ld+json node."""
+    assert post.had_posting_ldjson is True
+    assert post.looks_throttled is False
+
+
+def test_gated_page_with_no_ldjson_looks_throttled() -> None:
+    """LinkedIn's throttled 200 to a suspect IP has no post ld+json node. That is the
+    signature the fetch actor retries -- a burst-throttled page, not a real empty post."""
+    gated = "<html><head><title>LinkedIn</title></head><body>Sign in to see this post</body></html>"
+    post = parse(gated, URL)
+    assert post.body is None
+    assert post.had_posting_ldjson is False
+    assert post.looks_throttled is True
+
+
+def test_genuinely_textless_post_is_not_throttled() -> None:
+    """A real post with no article text (e.g. an image-only post) HAS the ld+json node
+    but an empty articleBody. That is terminal 'empty', not a throttle to retry."""
+    html = """<html><script type="application/ld+json">
+    {"@type":"SocialMediaPosting","articleBody":"","datePublished":"2026-03-01T10:00:00Z"}
+    </script></html>"""
+    post = parse(html, URL)
+    assert post.body is None
+    assert post.had_posting_ldjson is True
+    assert post.looks_throttled is False
+
+
 # --- Auth wall / 999 detection: these must never be scored as legitimate ---
 
 def test_999_is_authwalled() -> None:

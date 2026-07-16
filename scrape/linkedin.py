@@ -55,11 +55,23 @@ class LinkedInPost:
     # is truncated, so a run where og-sourced bodies spike is a run whose scores are
     # quietly built on clipped text.
     source: str | None = None
+    # True if the page carried a SocialMediaPosting/VideoObject ld+json node -- i.e. it
+    # really is a post page. A public post page always has one. A throttled/gated 200
+    # (LinkedIn's response to a suspect IP under volume) does NOT. So `not
+    # had_posting_ldjson` with an empty body is the signature of a throttle, which the
+    # fetch actor should retry -- distinct from a genuinely text-less post (posting node
+    # present, empty articleBody), which is terminal.
+    had_posting_ldjson: bool = False
 
     @property
     def is_truncated(self) -> bool:
         """og:description is a clipped meta description, never the full post."""
         return self.source == "og:description"
+
+    @property
+    def looks_throttled(self) -> bool:
+        """Empty body AND no post ld+json node -> a gated/throttled page, not the post."""
+        return not self.body and not self.had_posting_ldjson
 
     @property
     def embed_text(self) -> str:
@@ -130,6 +142,7 @@ def parse(html: str, url: str) -> LinkedInPost:
     for node in _iter_ldjson_nodes(html):
         typename = node.get("@type")
         if typename == "SocialMediaPosting":
+            post.had_posting_ldjson = True
             body = _clean(node.get("articleBody"))
             if body:
                 post.body = body
@@ -140,6 +153,7 @@ def parse(html: str, url: str) -> LinkedInPost:
             if post.body:
                 return post
         elif typename == "VideoObject" and not post.body:
+            post.had_posting_ldjson = True
             body = _clean(node.get("description"))
             if body:
                 post.body = body
