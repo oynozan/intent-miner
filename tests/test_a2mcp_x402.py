@@ -123,6 +123,42 @@ def test_a_payee_alone_is_not_enough(monkeypatch: pytest.MonkeyPatch) -> None:
     settings.cache_clear()
 
 
+def test_keyword_is_accepted_from_query_or_body(configured, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: a real paid replay arrived with an empty body and this route answered
+    422 -- a buyer who had parted with money getting an error back. The challenge cannot
+    declare which carrier to use (the SDK's v2 RouteConfig has no output_schema), so both
+    must work.
+    """
+    from api import a2mcp
+
+    seen: list[tuple] = []
+    monkeypatch.setattr(a2mcp.repo, "create_run", lambda kw, icp: seen.append((kw, icp)) or "run-1")
+    monkeypatch.setattr(a2mcp.x402, "configured", lambda: True)
+
+    from types import SimpleNamespace
+    monkeypatch.setitem(
+        __import__("sys").modules, "pipeline.actors",
+        SimpleNamespace(start_run=SimpleNamespace(send=lambda _: None)),
+    )
+
+    assert a2mcp.create_job(body=None, keyword="from query", icp=None).job_id == "run-1"
+    assert a2mcp.create_job(body=a2mcp.CreateJob(keyword="from body"), keyword=None, icp=None).job_id == "run-1"
+    assert [kw for kw, _ in seen] == ["from query", "from body"]
+
+
+def test_a_keyword_absent_from_both_is_a_400_not_a_422(configured, monkeypatch: pytest.MonkeyPatch) -> None:
+    """400 with a usable message beats pydantic's 422 for a caller that just paid."""
+    from fastapi import HTTPException
+
+    from api import a2mcp
+
+    monkeypatch.setattr(a2mcp.x402, "configured", lambda: True)
+    with pytest.raises(HTTPException) as exc:
+        a2mcp.create_job(body=None, keyword=None, icp=None)
+    assert exc.value.status_code == 400
+    assert "keyword" in exc.value.detail
+
+
 def test_unconfigured_serves_no_paid_work(unconfigured, monkeypatch: pytest.MonkeyPatch) -> None:
     """The failure this whole arrangement exists to prevent. With no payment gate
     installed, a create call must NOT reach the pipeline -- an unconfigured deployment

@@ -39,7 +39,12 @@ def _gate() -> None:
 
 
 class CreateJob(BaseModel):
-    keyword: str = Field(min_length=2, max_length=500, description="The solution or product to mine pain for.")
+    """The JSON-body form of the input. Both fields are optional here because the query
+    string is an equally valid carrier -- create_job merges the two and validates the
+    result, so requiring anything at this layer would reject a legitimate query-only
+    call before the handler ever sees it."""
+
+    keyword: str | None = Field(default=None, max_length=500, description="The solution or product to mine pain for.")
     icp: str | None = Field(default=None, max_length=500, description="Optional ideal-customer hint.")
 
 
@@ -61,8 +66,21 @@ class JobStatus(BaseModel):
     summary="Create a job from a keyword (paid)",
     responses={402: {"description": "Payment required; the challenge is in `PAYMENT-REQUIRED`."}},
 )
-def create_job(body: CreateJob) -> JobCreated:
+def create_job(
+    body: CreateJob | None = None,
+    keyword: str | None = Query(default=None, description="The solution or product to mine pain for."),
+    icp: str | None = Query(default=None, description="Optional ideal-customer hint."),
+) -> JobCreated:
     """Queue an intent-mining job for one keyword. Payment has already settled.
+
+    **Accepts the keyword as a query param OR a JSON body, deliberately.** The x402
+    challenge has no way to tell a buyer which to use -- the SDK's v2 RouteConfig has no
+    output_schema field, that lives only in its legacy v1 types -- so the buyer chooses,
+    and a real one was measured choosing neither: the paid replay arrived with an empty
+    body and this route answered 422. On a free endpoint that is a bad request; on a paid
+    one it is a buyer who has parted with money and received an error, which is the one
+    outcome worth writing extra code to avoid. Read both, and fail with 400 and a usable
+    message only when the keyword is genuinely absent.
 
     The work itself stays asynchronous -- poll the status service. Returns 200 rather
     than 202 because a buyer who has just paid should not have to interpret a 2xx that
@@ -70,12 +88,18 @@ def create_job(body: CreateJob) -> JobCreated:
     """
     _gate()
 
+    keyword = keyword or (body.keyword if body else None)
+    icp = icp or (body.icp if body else None)
+    if not keyword or len(keyword.strip()) < 2:
+        raise HTTPException(400, "keyword is required, as a query param or a JSON body field")
+    keyword = keyword.strip()[:500]
+
     # Imported here rather than at module scope: this pulls in dramatiq and the whole
     # actor chain, and an import error anywhere in the pipeline should not turn an
     # unpaid probe -- every buyer's first request -- into a 500 instead of a price quote.
     from pipeline.actors import start_run
 
-    run_id = repo.create_run(body.keyword, body.icp)
+    run_id = repo.create_run(keyword, icp)
     start_run.send(run_id)
     return JobCreated(job_id=run_id, status="pending")
 
