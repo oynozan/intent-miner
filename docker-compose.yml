@@ -82,7 +82,11 @@ services:
       # Loopback only -- nginx is the sole public door, and it exposes /a2mcp/* alone.
       # Published on 0.0.0.0 this would serve the free /runs API next to the paid one:
       # same pipeline, same LLM and SERP spend, no payment.
-      - "127.0.0.1:8001:8000"
+      #
+      # Host side only: set API_PORT in .env to move it (nginx must proxy to the same
+      # number). The container always listens on 8000 -- see `command:` above -- so the
+      # right side never changes, and neither does anything inside the compose network.
+      - "127.0.0.1:${API_PORT:-8001}:8000"
     depends_on:
       postgres:
         condition: service_healthy
