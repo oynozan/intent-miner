@@ -58,6 +58,16 @@ def canonicalize(url: str) -> str:
     platform = platform_of(url)
     if platform == PLATFORM_LINKEDIN:
         path = _canonical_linkedin_path(path)
+        # LinkedIn is the one host where dropping `www.` changes what you get served.
+        # Measured back to back on the same public post, same client, same second:
+        #     https://www.linkedin.com/posts/{slug}  -> 200, 335,526 bytes, articleBody
+        #     https://linkedin.com/posts/{slug}      -> 200,  20,488 bytes, no ld+json
+        # There is no redirect -- the bare host answers with a stub. Both are 200, so
+        # nothing downstream looks like a failure: the stub parses to an empty body and
+        # `looks_throttled` (no post ld+json node), so every LinkedIn candidate gets
+        # retried three times and then trips the throttle circuit breaker. That is the
+        # real "why no LinkedIn links", and it was misread as IP throttling.
+        host = "www.linkedin.com"
     elif platform == PLATFORM_REDDIT:
         path = _canonical_reddit_path(path)
 

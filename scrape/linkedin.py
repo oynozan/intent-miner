@@ -43,6 +43,13 @@ _OG_TAIL = re.compile(r"\s*\|\s*\d+\s+comments?\s+on\s+LinkedIn\s*$", re.I)
 
 _AUTHWALL_MARKERS = ("/authwall", "/signup/cold-join", "/uas/login", "/checkpoint/challenge")
 
+# The ld+json @type carrying articleBody. LinkedIn now emits `DiscussionForumPosting`
+# on public post pages; it used to be `SocialMediaPosting`. Both are accepted because
+# the rename is theirs to reverse, and matching only one is a silent failure: the node
+# is missed, `had_posting_ldjson` stays False, parse falls through to the truncated
+# og:description, and posted_at/engagement come back None/0 on a page that had both.
+_POSTING_TYPES = ("SocialMediaPosting", "DiscussionForumPosting")
+
 
 @dataclass
 class LinkedInPost:
@@ -130,9 +137,14 @@ def is_authwalled(status_code: int, final_url: str, html: str) -> bool:
 def parse(html: str, url: str) -> LinkedInPost:
     """Extract the post via the three-tier chain, best source first.
 
-    1. ld+json SocialMediaPosting.articleBody -- full text, the only complete source
-    2. ld+json VideoObject.description        -- video posts carry text here instead
-    3. og:description                         -- TRUNCATED. Last resort, flagged.
+    1. ld+json _POSTING_TYPES.articleBody -- full text, the only complete source, and
+       the ONLY tier that also yields datePublished + commentCount
+    2. ld+json VideoObject.description    -- video posts carry text here instead
+    3. og:description                     -- TRUNCATED. Last resort, flagged.
+
+    Tier 1 is not just about body length: tiers 2 and 3 return posted_at=None and
+    engagement=0, so a run that silently falls to tier 3 has no recency decay and no
+    engagement signal for any LinkedIn row.
 
     Tier 3 is never silently acceptable: it ends mid-sentence with "... | 274 comments
     on LinkedIn", so it feeds clipped text to the scorer while looking like a success.
@@ -141,7 +153,7 @@ def parse(html: str, url: str) -> LinkedInPost:
 
     for node in _iter_ldjson_nodes(html):
         typename = node.get("@type")
-        if typename == "SocialMediaPosting":
+        if typename in _POSTING_TYPES:
             post.had_posting_ldjson = True
             body = _clean(node.get("articleBody"))
             if body:

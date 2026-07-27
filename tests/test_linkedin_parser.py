@@ -96,6 +96,28 @@ def test_gated_page_with_no_ldjson_looks_throttled() -> None:
     assert post.looks_throttled is True
 
 
+def test_discussionforumposting_is_a_post_node() -> None:
+    """LinkedIn renamed the node: live public posts now emit `DiscussionForumPosting`,
+    not `SocialMediaPosting`. Matching only the old name is silent -- the body still
+    arrives via the truncated og fallback, but posted_at and engagement come back
+    None/0 and had_posting_ldjson stays False, so real empties look like throttles.
+    """
+    html = """<html>
+    <meta property="og:description" content="clipped version | 26 comments on LinkedIn" />
+    <script type="application/ld+json">
+    {"@type":"DiscussionForumPosting","articleBody":"I built an AI system that churns out SEO tasks",
+     "datePublished":"2025-11-05T03:17:47.158Z","commentCount":26,
+     "author":{"@type":"Person","name":"Matt Diggity"}}
+    </script></html>"""
+    post = parse(html, URL)
+    assert post.source == "articleBody", "must not fall through to the truncated og tier"
+    assert post.body == "I built an AI system that churns out SEO tasks"
+    assert post.had_posting_ldjson is True
+    assert post.is_truncated is False
+    assert post.posted_at is not None and post.posted_at.year == 2025
+    assert post.engagement == 26
+
+
 def test_genuinely_textless_post_is_not_throttled() -> None:
     """A real post with no article text (e.g. an image-only post) HAS the ld+json node
     but an empty articleBody. That is terminal 'empty', not a throttle to retry."""
@@ -138,8 +160,29 @@ def test_real_post_not_flagged_as_authwalled() -> None:
 
 def test_post_url_canonicalizes_to_slug() -> None:
     assert canonicalize(URL + "?utm_source=x&trk=y") == (
-        "https://linkedin.com/posts/tarapowers_looking-for-a-tool-that-builds-relationships"
+        "https://www.linkedin.com/posts/tarapowers_looking-for-a-tool-that-builds-relationships"
         "-activity-7463608443963318272-2kSA"
+    )
+
+
+def test_canonical_linkedin_keeps_www() -> None:
+    """The bare host serves a 20KB stub instead of the post -- 200, no redirect, no
+    ld+json. Stripping `www.` here is what made every LinkedIn candidate look throttled.
+    Measured: www -> 335,526 bytes with articleBody; bare -> 20,488 bytes without.
+    """
+    for given in (
+        "https://linkedin.com/posts/abc_def-activity-123-xy",
+        "https://www.linkedin.com/posts/abc_def-activity-123-xy",
+        "http://LinkedIn.com/posts/abc_def-activity-123-xy?utm_source=x",
+    ):
+        assert canonicalize(given) == "https://www.linkedin.com/posts/abc_def-activity-123-xy"
+
+
+def test_other_platforms_still_drop_www() -> None:
+    """The www rule is LinkedIn-specific, not a global change of the dedupe key."""
+    assert canonicalize("https://www.quora.com/Some-Question") == "https://quora.com/Some-Question"
+    assert canonicalize("https://www.reddit.com/r/SaaS/comments/1nhh66z/title/") == (
+        "https://reddit.com/comments/1nhh66z"
     )
 
 
