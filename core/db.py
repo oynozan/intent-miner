@@ -28,7 +28,13 @@ def pool() -> ConnectionPool:
             min_size=1,
             max_size=16,
             open=False,
-            kwargs={"row_factory": dict_row},
+            # connect_timeout is not a nicety. A host that resolves to several addresses
+            # (`localhost` -> ::1 then 127.0.0.1 is the common one) makes libpq try each
+            # in turn, and with no timeout a dead family hangs the pool's worker thread
+            # for longer than the pool's own 30s wait -- so callers see PoolTimeout,
+            # "couldn't get a connection", while a direct connect to the same URL
+            # succeeds instantly. Bounding it per-address turns that into a fast failover.
+            kwargs={"row_factory": dict_row, "connect_timeout": 5},
         )
         _pool.open()
     return _pool

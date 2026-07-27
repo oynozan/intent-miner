@@ -65,8 +65,13 @@ services:
       echo 'bucket ready'
       "
 
+  # api and every worker run the SAME image and must share one `image:` name. Without
+  # it, `build: .` on six services builds six identical images -- and Compose builds
+  # them in parallel, so six copies of `playwright install chromium` run at once and the
+  # daemon OOM-kills the build (exit 137). One name, one build, one image on disk.
   api:
     build: .
+    image: intent-miner:local
     command: uvicorn api.main:app --host 0.0.0.0 --port 8000
     env_file: .env
     environment:
@@ -90,6 +95,7 @@ services:
   # from starving the LLM lanes, and lets each scale independently.
   worker-expand:
     build: .
+    image: intent-miner:local
     command: dramatiq worker worker --processes 1 --threads 2 --queues expand
     env_file: .env
     environment: &worker_env
@@ -110,6 +116,7 @@ services:
   # saturates 4/s with headroom for a slow response.
   worker-discover:
     build: .
+    image: intent-miner:local
     command: dramatiq worker worker --processes 1 --threads 6 --queues discover
     env_file: .env
     environment: *worker_env
@@ -123,6 +130,7 @@ services:
 
   worker-fetch:
     build: .
+    image: intent-miner:local
     command: dramatiq worker worker --processes 2 --threads 16 --queues fetch
     env_file: .env
     environment: *worker_env
@@ -140,6 +148,7 @@ services:
   # Quora stays on the fast `fetch` queue above.
   worker-fetch-linkedin:
     build: .
+    image: intent-miner:local
     command: dramatiq worker worker --processes 1 --threads 2 --queues fetch_linkedin
     env_file: .env
     environment: *worker_env
@@ -153,6 +162,7 @@ services:
 
   worker-score:
     build: .
+    image: intent-miner:local
     command: dramatiq worker worker --processes 2 --threads 8 --queues score
     env_file: .env
     environment: *worker_env

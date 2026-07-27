@@ -22,8 +22,12 @@ def _env(key: str, default: str | None = None) -> str:
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str = field(default_factory=lambda: _env("DATABASE_URL", "postgresql://intent:intent@localhost:5432/intent_miner"))
-    redis_url: str = field(default_factory=lambda: _env("REDIS_URL", "redis://localhost:6380/0"))
+    # 127.0.0.1, not localhost. Compose publishes these on the IPv4 loopback only, while
+    # `localhost` resolves to ::1 first on Windows -- so the name points at an address
+    # nothing is listening on and every host-side connection pays a failover it does not
+    # need to. Inside compose these are overridden with the service names anyway.
+    database_url: str = field(default_factory=lambda: _env("DATABASE_URL", "postgresql://intent:intent@127.0.0.1:5432/intent_miner"))
+    redis_url: str = field(default_factory=lambda: _env("REDIS_URL", "redis://127.0.0.1:6380/0"))
 
     s3_endpoint: str = field(default_factory=lambda: _env("S3_ENDPOINT", "http://localhost:9002"))
     s3_bucket: str = field(default_factory=lambda: _env("S3_BUCKET", "intent-raw"))
