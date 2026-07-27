@@ -349,7 +349,7 @@ def test_a_one_cookie_jar_is_treated_as_a_failed_mint(monkeypatch, fake_redis) -
     still runs, and it yields exactly one cookie (`edgebucket`). mint_jar does not raise,
     so without this check that useless jar is cached for the full TTL and gates every
     fetch made with it -- a dead path that looks perfectly healthy."""
-    monkeypatch.setattr(reddit, "mint_jar", lambda: {"edgebucket": "1nFVfdZahyp0uvvAEO"})
+    monkeypatch.setattr(reddit, "mint_jar", lambda: {"edgebucket": "placeholder-not-a-real-cookie"})
 
     with pytest.raises(RuntimeError, match="blocked"):
         reddit.jar()
