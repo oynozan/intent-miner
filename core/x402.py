@@ -43,7 +43,10 @@ def network() -> str:
 def configured() -> bool:
     """True when there is enough to actually charge for a call."""
     cfg = settings()
-    return bool(cfg.okx_api_key and cfg.okx_secret_key and cfg.okx_passphrase and cfg.x402_pay_to)
+    return bool(
+        cfg.okx_api_key and cfg.okx_secret_key and cfg.okx_passphrase
+        and cfg.x402_pay_to and cfg.a2mcp_base_url
+    )
 
 
 def missing() -> list[str]:
@@ -57,6 +60,7 @@ def missing() -> list[str]:
             ("OKX_SECRET_KEY", cfg.okx_secret_key),
             ("OKX_PASSPHRASE", cfg.okx_passphrase),
             ("X402_PAY_TO", cfg.x402_pay_to),
+            ("A2MCP_BASE_URL", cfg.a2mcp_base_url),
         )
         if not value
     ]
@@ -85,14 +89,24 @@ def routes() -> dict:
             max_timeout_seconds=cfg.x402_timeout_seconds,
         )
 
+    # `resource` is pinned from A2MCP_BASE_URL rather than derived from the request.
+    # Behind nginx the app is reached over plain HTTP, so a derived resource advertises
+    # `http://host/...` while buyers pay at `https://host/...` -- and a buyer who pays
+    # for one resource and replays against another is exactly what `resource` exists to
+    # prevent. It also has to equal the endpoint registered on-chain, which is a fixed
+    # string, not whatever scheme a proxy hop happened to use.
+    base = cfg.a2mcp_base_url.rstrip("/")
+
     return {
         CREATE_ROUTE: RouteConfig(
             accepts=[option(cfg.a2mcp_price_create_job)],
+            resource=f"{base}/a2mcp/jobs",
             description="Start an intent-mining job from one keyword.",
             mime_type="application/json",
         ),
         STATUS_ROUTE: RouteConfig(
             accepts=[option(cfg.a2mcp_price_job_status)],
+            resource=f"{base}/a2mcp/jobs/status",
             description="Job status plus the ranked links discovered so far.",
             mime_type="application/json",
         ),

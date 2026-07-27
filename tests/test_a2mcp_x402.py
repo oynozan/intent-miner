@@ -23,6 +23,7 @@ CREDS = {
     "OKX_SECRET_KEY": "test-secret",
     "OKX_PASSPHRASE": "test-passphrase",
     "X402_PAY_TO": "0x25a39c21b29b80df5b7fc59286aa7dc6f10f9c13",
+    "A2MCP_BASE_URL": "https://miner.example.com",
 }
 
 
@@ -77,6 +78,15 @@ def test_both_routes_settle_on_x_layer_to_the_configured_payee(configured) -> No
         assert option.network == "eip155:196"
         assert option.pay_to == CREDS["X402_PAY_TO"]
         assert option.scheme == "exact"
+
+
+def test_resource_is_the_registered_https_url_not_the_proxy_hop(configured) -> None:
+    """Behind nginx the app is reached over plain HTTP, so a resource derived from the
+    request advertises http://host/... while buyers pay at https://host/... -- and it
+    must also equal the endpoint registered on-chain, which is a fixed string."""
+    routes = x402.routes()
+    assert routes[x402.CREATE_ROUTE].resource == "https://miner.example.com/a2mcp/jobs"
+    assert routes[x402.STATUS_ROUTE].resource == "https://miner.example.com/a2mcp/jobs/status"
 
 
 def test_route_keys_match_the_real_paths(configured) -> None:
