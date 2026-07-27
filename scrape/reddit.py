@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -53,6 +54,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
@@ -146,13 +148,47 @@ def mint_jar(timeout: float = 120.0) -> dict[str, str]:
     return json.loads(proc.stdout)
 
 
+def _proxy() -> dict[str, str] | None:
+    """Playwright proxy config from ``REDDIT_MINT_PROXY``, or None.
+
+    Reddit refuses datacenter IPs at the edge. Measured with the *same* Playwright
+    build, same Chrome UA, same flags, minutes apart:
+
+        residential IP   200, 12 cookies (loid / csv / pxrc present)
+        datacenter VPS   403, 1 cookie  (edgebucket only), ~190KB interstitial
+
+    So the client was never the problem and no stealth tooling addresses it -- obscura
+    was measured at 1 cookie even from a residential IP, worse than plain Chromium.
+    Only the address matters, and only for this one call: a mint happens about once per
+    30 fetches, never per URL, so the cheapest residential proxy covers a whole run and
+    the per-URL fetches keep going out direct.
+
+    Accepts one URL, credentials inline: ``http://user:pass@host:port``.
+    """
+    raw = os.environ.get("REDDIT_MINT_PROXY", "").strip()
+    if not raw:
+        return None
+
+    parsed = urlparse(raw)
+    if not parsed.hostname:
+        log.warning("REDDIT_MINT_PROXY is set but unparseable; minting direct")
+        return None
+
+    config = {"server": f"{parsed.scheme or 'http'}://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        config["username"] = parsed.username
+        config["password"] = parsed.password or ""
+    return config
+
+
 def _mint_here() -> dict[str, str]:
     """The actual browser work. Only ever called in the child, on its main thread."""
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
-            headless=True, args=["--disable-blink-features=AutomationControlled"])
+            headless=True, args=["--disable-blink-features=AutomationControlled"],
+            proxy=_proxy())
         try:
             ctx = browser.new_context(user_agent=UA, viewport={"width": 1440, "height": 900},
                                       locale="en-US")

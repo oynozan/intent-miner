@@ -399,3 +399,33 @@ def test_the_block_marker_expires_so_a_recovered_host_retries(monkeypatch, fake_
     fake_redis.store.pop(reddit._MINT_FAIL_KEY)          # simulate the TTL lapsing
     monkeypatch.setattr(reddit, "mint_jar", lambda: {"loid": "a", "csv": "b", "pxrc": "c"})
     assert reddit.jar() == {"loid": "a", "csv": "b", "pxrc": "c"}
+
+
+# --- minting through a residential proxy --------------------------------------------
+
+def test_no_proxy_configured_mints_direct(monkeypatch) -> None:
+    monkeypatch.delenv("REDDIT_MINT_PROXY", raising=False)
+    assert reddit._proxy() is None
+
+
+def test_proxy_url_is_split_into_playwright_config(monkeypatch) -> None:
+    """Playwright wants server separate from credentials, so an inline user:pass URL --
+    the form every proxy vendor hands you -- has to be taken apart."""
+    monkeypatch.setenv("REDDIT_MINT_PROXY", "http://bob:s3cret@resi.example.com:8080")
+    assert reddit._proxy() == {
+        "server": "http://resi.example.com:8080",
+        "username": "bob",
+        "password": "s3cret",
+    }
+
+
+def test_proxy_without_credentials_omits_them(monkeypatch) -> None:
+    monkeypatch.setenv("REDDIT_MINT_PROXY", "http://10.0.0.9:3128")
+    assert reddit._proxy() == {"server": "http://10.0.0.9:3128"}
+
+
+def test_an_unparseable_proxy_mints_direct_rather_than_crashing(monkeypatch) -> None:
+    """A typo in an env var must not take the whole fetch path down -- direct minting
+    still degrades to the SERP fallback, a raised ValueError kills the worker."""
+    monkeypatch.setenv("REDDIT_MINT_PROXY", "not a url")
+    assert reddit._proxy() is None

@@ -74,7 +74,7 @@ so this stack can run alongside the sibling `bg-remover` stack, which binds 6379
 
 ```bash
 docker compose exec -T postgres psql -U intent -d intent_miner -c "\dt"
-pytest    # 179 tests; needs redis on 6380
+pytest    # 183 tests; needs redis on 6380
 ```
 
 ## What the research changed
@@ -216,6 +216,19 @@ the path), and any mint failure is remembered in Redis for 15 minutes so the bro
 skipped entirely until then. Short TTL on purpose -- a host that regains access recovers
 without a deploy. **On a blocked host Reddit still works, just SERP-only:** title and
 snippet, no body, no `posted_at`, no `engagement`.
+
+It is the address and nothing else. The same Playwright build, Chrome UA and flags,
+minutes apart:
+
+```
+residential IP   200, 12 cookies (loid / csv / pxrc present)
+datacenter VPS   403,  1 cookie  (edgebucket), ~190KB interstitial
+```
+
+So stealth tooling is the wrong layer -- obscura returns 1 cookie even from a
+residential IP, worse than plain Chromium. `REDDIT_MINT_PROXY` routes **only the mint**
+through a residential proxy; the per-URL `.json` fetches keep going out direct, so one
+cheap proxy covers a whole run at roughly one request per 30 candidates.
 
 `.json` gives `selftext` (the real body), `created_utc` (real recency, replacing the 0.5
 unknown-date default), `ups` and `num_comments`. The last two are deliberately kept
@@ -387,7 +400,7 @@ llm/          client.py, embeddings.py, prompts/{expand,score}.md
 pipeline/     actors.py, stages.py, prefilter.py, repo.py
 scrape/       quora.py (parser kept; fetch retired -- SERP-only), linkedin.py,
               reddit.py (cookie-jar mint + .json fetch; the only browser in the stack)
-tests/        179 tests; fixtures/ are live captures, not mocks
+tests/        183 tests; fixtures/ are live captures, not mocks
 ```
 
 ## Next
