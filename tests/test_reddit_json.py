@@ -272,7 +272,7 @@ def test_a_cold_jar_is_minted_once_for_the_whole_thread_pool(monkeypatch, fake_r
     def _mint():
         time.sleep(0.05)                    # a real launch is ~7s; this is the same race
         mints.append(1)
-        return {"loid": "x"}
+        return {"loid": "x", "csv": "y", "pxrc": "z"}
 
     def _worker():
         start.wait(timeout=5)               # all six ask for the jar at the same moment
@@ -286,28 +286,28 @@ def test_a_cold_jar_is_minted_once_for_the_whole_thread_pool(monkeypatch, fake_r
         t.join(timeout=10)
 
     assert len(mints) == 1, f"expected one browser launch, got {len(mints)}"
-    assert json.loads(fake_redis.store[reddit._JAR_KEY]) == {"loid": "x"}
+    assert json.loads(fake_redis.store[reddit._JAR_KEY]) == {"loid": "x", "csv": "y", "pxrc": "z"}
 
 
 def test_a_burst_of_gated_fetches_shares_one_replacement(monkeypatch, fake_redis) -> None:
     """A jar dies of volume, so when it dies every in-flight fetch gates within a second
     or two of the others. All of them naming the same dead jar must cost one launch."""
     mints = []
-    monkeypatch.setattr(reddit, "mint_jar", lambda: (mints.append(1) or {"loid": str(len(mints))}))
+    monkeypatch.setattr(reddit, "mint_jar", lambda: (mints.append(1) or {"loid": str(len(mints)), "csv": "y", "pxrc": "z"}))
 
     dead = {"loid": "dead"}
     fake_redis.store[reddit._JAR_KEY] = json.dumps(dead)
     replacements = [reddit.jar(stale=dead) for _ in range(6)]
 
     assert len(mints) == 1, f"expected one replacement for the burst, got {len(mints)}"
-    assert all(r == {"loid": "1"} for r in replacements), "all six must get the new jar"
+    assert all(r == {"loid": "1", "csv": "y", "pxrc": "z"} for r in replacements), "all six must get the new jar"
 
 
 def test_the_next_jar_to_die_is_replaced_too(monkeypatch, fake_redis) -> None:
     """~30 fetches later the replacement dies in turn. A time-based grace window would
     suppress this second mint; naming the dead jar cannot."""
     mints = []
-    monkeypatch.setattr(reddit, "mint_jar", lambda: (mints.append(1) or {"loid": str(len(mints))}))
+    monkeypatch.setattr(reddit, "mint_jar", lambda: (mints.append(1) or {"loid": str(len(mints)), "csv": "y", "pxrc": "z"}))
 
     first = reddit.jar(stale={"loid": "dead"})
     second = reddit.jar(stale=first)
@@ -327,9 +327,9 @@ def test_a_live_jar_is_never_replaced(monkeypatch, fake_redis) -> None:
 
 def test_an_unreadable_cached_jar_is_replaced(monkeypatch, fake_redis) -> None:
     fake_redis.store[reddit._JAR_KEY] = b"not json"
-    monkeypatch.setattr(reddit, "mint_jar", lambda: {"loid": "x"})
+    monkeypatch.setattr(reddit, "mint_jar", lambda: {"loid": "x", "csv": "y", "pxrc": "z"})
 
-    assert reddit.jar() == {"loid": "x"}
+    assert reddit.jar() == {"loid": "x", "csv": "y", "pxrc": "z"}
 
 
 def test_reddit_fetch_is_paced() -> None:
@@ -340,3 +340,62 @@ def test_reddit_fetch_is_paced() -> None:
     assert "reddit.com" in limits.LIMITS
     windows = {w for _, w in limits.LIMITS["reddit.com"]}
     assert len(windows) > 1, "a per-second rate alone cannot express a longer quota"
+
+
+# --- a host Reddit blocks -----------------------------------------------------------
+
+def test_a_one_cookie_jar_is_treated_as_a_failed_mint(monkeypatch, fake_redis) -> None:
+    """Measured on a VPS: Reddit answers 403 with a ~190KB interstitial, the browser
+    still runs, and it yields exactly one cookie (`edgebucket`). mint_jar does not raise,
+    so without this check that useless jar is cached for the full TTL and gates every
+    fetch made with it -- a dead path that looks perfectly healthy."""
+    monkeypatch.setattr(reddit, "mint_jar", lambda: {"edgebucket": "1nFVfdZahyp0uvvAEO"})
+
+    with pytest.raises(RuntimeError, match="blocked"):
+        reddit.jar()
+
+    assert reddit._JAR_KEY not in fake_redis.store, "a useless jar must never be cached"
+
+
+def test_a_blocked_host_stops_launching_the_browser(monkeypatch, fake_redis) -> None:
+    """The cost this saves. Every reddit candidate asks for a jar, and on a blocked host
+    every ask used to launch chromium -- twice per candidate once the stale-jar retry is
+    counted. After the first failure the browser is skipped until the marker expires."""
+    launches = []
+    monkeypatch.setattr(reddit, "mint_jar", lambda: launches.append(1) or {"edgebucket": "x"})
+
+    for _ in range(10):
+        with pytest.raises(RuntimeError):
+            reddit.jar()
+
+    assert len(launches) == 1, f"expected one launch for ten candidates, got {len(launches)}"
+
+
+def test_a_raising_mint_is_remembered_too(monkeypatch, fake_redis) -> None:
+    """A crashed browser is as expensive to retry as a blocked one."""
+    launches = []
+
+    def _boom():
+        launches.append(1)
+        raise RuntimeError("playwright exploded")
+
+    monkeypatch.setattr(reddit, "mint_jar", _boom)
+
+    for _ in range(5):
+        with pytest.raises(RuntimeError):
+            reddit.jar()
+
+    assert len(launches) == 1
+
+
+def test_the_block_marker_expires_so_a_recovered_host_retries(monkeypatch, fake_redis) -> None:
+    """Short TTL on purpose: an IP that regains access must recover on its own, without
+    a deploy or a manual key delete."""
+    monkeypatch.setattr(reddit, "mint_jar", lambda: {"edgebucket": "x"})
+    with pytest.raises(RuntimeError):
+        reddit.jar()
+    assert reddit._MINT_FAIL_KEY in fake_redis.store
+
+    fake_redis.store.pop(reddit._MINT_FAIL_KEY)          # simulate the TTL lapsing
+    monkeypatch.setattr(reddit, "mint_jar", lambda: {"loid": "a", "csv": "b", "pxrc": "c"})
+    assert reddit.jar() == {"loid": "a", "csv": "b", "pxrc": "c"}

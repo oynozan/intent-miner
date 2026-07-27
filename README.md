@@ -74,7 +74,7 @@ so this stack can run alongside the sibling `bg-remover` stack, which binds 6379
 
 ```bash
 docker compose exec -T postgres psql -U intent -d intent_miner -c "\dt"
-pytest    # 172 tests; needs redis on 6380
+pytest    # 179 tests; needs redis on 6380
 ```
 
 ## What the research changed
@@ -201,6 +201,21 @@ every re-mint silently degrading to the SERP fallback.
 failure: a stale jar, a Reddit change or one bad response falls back to `_from_serp`, so
 the worst outcome is exactly the old behaviour. Reddit supplies most of this pipeline's
 leads; a fetch layer that can turn them into `failed` rows is the worse trade.
+
+**The mint needs a residential IP, and a datacenter one fails in a shape that looks like
+success.** Measured on a VPS: Reddit answers `403` with a ~190KB interstitial, Chromium
+runs to completion, and the jar comes back holding exactly one cookie (`edgebucket`) --
+the same thing a bare HTTP client gets. `mint_jar` does not raise, so nothing looks
+wrong. Cached, that jar gates every fetch made with it for the full 2h TTL, and each
+gated fetch asks for a replacement, so a blocked host pays *two* browser launches per
+Reddit candidate to reach the SERP fallback it was always going to reach.
+
+Hence two guards in `jar()`: a jar under `_MIN_USEFUL_COOKIES` is treated as a failed
+mint rather than cached (counted, not name-matched, so a renamed cookie does not disable
+the path), and any mint failure is remembered in Redis for 15 minutes so the browser is
+skipped entirely until then. Short TTL on purpose -- a host that regains access recovers
+without a deploy. **On a blocked host Reddit still works, just SERP-only:** title and
+snippet, no body, no `posted_at`, no `engagement`.
 
 `.json` gives `selftext` (the real body), `created_utc` (real recency, replacing the 0.5
 unknown-date default), `ups` and `num_comments`. The last two are deliberately kept
@@ -372,7 +387,7 @@ llm/          client.py, embeddings.py, prompts/{expand,score}.md
 pipeline/     actors.py, stages.py, prefilter.py, repo.py
 scrape/       quora.py (parser kept; fetch retired -- SERP-only), linkedin.py,
               reddit.py (cookie-jar mint + .json fetch; the only browser in the stack)
-tests/        172 tests; fixtures/ are live captures, not mocks
+tests/        179 tests; fixtures/ are live captures, not mocks
 ```
 
 ## Next

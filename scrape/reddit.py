@@ -64,6 +64,25 @@ _JAR_KEY = "reddit:cookiejar"
 # roughly once per 30 candidates regardless of this TTL.
 _JAR_TTL_SECONDS = 2 * 3600
 
+# Minting is not always possible, and the failure is per-host rather than per-request:
+# Reddit answers a datacenter IP with 403 and a ~190KB interstitial, so the browser runs,
+# returns a lone `edgebucket`, and no amount of retrying changes it. Without a memory of
+# that, every Reddit candidate launches Chromium twice (once cold, once for the stale-jar
+# replacement) and every launch is doomed -- hundreds of them per run, each costing an
+# interpreter start and a browser boot, to arrive at the SERP fallback anyway.
+#
+# So a failed mint is remembered for this long and the browser is skipped entirely until
+# it expires. Short enough that a host which regains access recovers on its own.
+_MINT_FAIL_KEY = "reddit:cookiejar:unavailable"
+_MINT_FAIL_TTL_SECONDS = 15 * 60
+
+# A real jar carries ~12 cookies including loid / csv / pxrc. A blocked or JS-less page
+# yields exactly one (`edgebucket`), which is indistinguishable from success to a caller
+# that only checks for an exception -- and it is worse than no jar, because it caches for
+# the full TTL and gates every fetch made with it. Counting rather than name-matching so
+# a renamed cookie does not silently disable the whole path.
+_MIN_USEFUL_COOKIES = 3
+
 _MINT_LOCK = threading.Lock()
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -186,7 +205,21 @@ def jar(stale: dict[str, str] | None = None) -> dict[str, str]:
         hit = cached()                    # someone may have minted while we waited
         if hit is not None and hit != stale:
             return hit
-        fresh = mint_jar()
+        if _redis.get(_MINT_FAIL_KEY):
+            raise RuntimeError("reddit jar mint failed recently on this host; not retrying yet")
+        try:
+            fresh = mint_jar()
+        except Exception:
+            _redis.setex(_MINT_FAIL_KEY, _MINT_FAIL_TTL_SECONDS, "1")
+            raise
+        if len(fresh) < _MIN_USEFUL_COOKIES:
+            # Succeeded mechanically, produced nothing usable -- the blocked-host case.
+            # Caching this would gate every fetch for the whole TTL while looking healthy.
+            _redis.setex(_MINT_FAIL_KEY, _MINT_FAIL_TTL_SECONDS, "1")
+            raise RuntimeError(
+                f"reddit jar mint returned {len(fresh)} cookie(s) ({', '.join(sorted(fresh)) or 'none'}); "
+                "this host is most likely blocked by Reddit -- falling back to the SERP row"
+            )
         _redis.setex(_JAR_KEY, _JAR_TTL_SECONDS, json.dumps(fresh))
         log.info("minted reddit cookie jar (%d cookies)", len(fresh))
         return fresh
