@@ -29,11 +29,6 @@ class Settings:
     database_url: str = field(default_factory=lambda: _env("DATABASE_URL", "postgresql://intent:intent@127.0.0.1:5432/intent_miner"))
     redis_url: str = field(default_factory=lambda: _env("REDIS_URL", "redis://127.0.0.1:6380/0"))
 
-    s3_endpoint: str = field(default_factory=lambda: _env("S3_ENDPOINT", "http://localhost:9002"))
-    s3_bucket: str = field(default_factory=lambda: _env("S3_BUCKET", "intent-raw"))
-    s3_access_key: str = field(default_factory=lambda: _env("S3_ACCESS_KEY", "minioadmin"))
-    s3_secret_key: str = field(default_factory=lambda: _env("S3_SECRET_KEY", "minioadmin"))
-
     openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
     anthropic_api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
     voyage_api_key: str = field(default_factory=lambda: os.environ.get("VOYAGE_API_KEY", ""))

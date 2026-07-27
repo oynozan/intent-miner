@@ -69,7 +69,7 @@ Without a working provider a run reaches `status: expanding` and stops on
 `no LLM provider configured` (or the provider's own auth error). Everything up to that
 point is verified working.
 
-Host ports are offset (API **8001**, Postgres 5432, Redis **6380**, MinIO **9002/9003**)
+Host ports are offset (API **8001** — override with `API_PORT` — Postgres 5432, Redis **6380**)
 so this stack can run alongside the sibling `bg-remover` stack, which binds 6379 and 9000.
 
 ```bash
