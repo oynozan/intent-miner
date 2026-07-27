@@ -136,6 +136,34 @@ def test_real_page_not_flagged_as_challenge(real_html: str) -> None:
     assert not is_challenge(real_html, 200, {"content-type": "text/html"})
 
 
+def test_429_with_a_full_size_body_is_still_a_challenge() -> None:
+    """is_challenge enumerated `status_code == 403`, so 429 fell through to the size
+    heuristic -- and Quora's 429 page is NOT small. Measured live: 176,365 bytes AND
+    containing `ansFrontendGlobals`, clearing both guards.
+
+    It was then parsed into a real-looking post whose question was the literal string
+    'Error 429 (Too Many Requests)', saved as fetch_status='ok', embedded and scored.
+    29 such rows landed in one run; only the prefilter's semantic kill stopped them
+    reaching the output, which is luck rather than a guard.
+
+    Enumerating statuses was the bug. A parseable page is a 200.
+    """
+    big_body = "ansFrontendGlobals" + ("x" * 200_000)
+    assert is_challenge(big_body, 429, {}), "429 is never a page, however large the body"
+    assert is_challenge(big_body, 503, {})
+    assert is_challenge(big_body, 302, {})
+    assert not is_challenge(big_body, 200, {}), "a genuine 200 of this shape must pass"
+
+
+def test_429_body_does_not_parse_into_a_usable_post() -> None:
+    """Belt and braces: even if a 429 reached parse(), the result must not look like a
+    real question. This is the shape that got saved 29 times."""
+    html = "<html><title>Error 429 (Too Many Requests)</title>ansFrontendGlobals</html>"
+    page = parse(html, "https://quora.com/x")
+    assert page.answers_seen == 0
+    assert not page.answer_count
+
+
 # --- The triple decode, unit level ---
 
 def test_decode_rich_text_walks_sections_and_spans() -> None:

@@ -20,7 +20,17 @@ httpx==0.28.1
 # Mandatory for Quora, not a preference. Measured from one IP: httpx (OpenSSL TLS)
 # was challenged 0/6; curl_cffi (Chrome TLS) succeeded 3/3. Quora fingerprints the
 # handshake, so no proxy fixes what this fixes. LinkedIn does not need it.
+# Also carries every Reddit .json fetch, once a cookie jar is held.
 curl_cffi==0.15.0
+
+# Reddit cookie jar only -- roughly one browser launch per 2h TTL, never per URL.
+# Reddit's gate is state, not fingerprint: with no cookies its .json is 403 (0/6), with
+# a browser-minted jar it is 200 (20/20 at 0.83s each) via curl_cffi. The cheap ways to
+# mint that jar were measured and both fail -- a curl_cffi GET of the homepage and
+# `obscura --stealth --dump cookies` each return a lone `edgebucket`, while headless
+# Chromium returns 12 including loid/csv/pxrc, which are written by page JavaScript.
+# That is the entire reason this dependency exists; see scrape/reddit.py.
+playwright==1.61.0
 
 # Primary LLM + embedding provider. 2.45.0 supports gpt-5-nano's reasoning params
 # (max_completion_tokens, reasoning_effort) and strict json_schema structured output.

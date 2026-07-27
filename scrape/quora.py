@@ -151,7 +151,12 @@ def is_challenge(html: str, status_code: int, headers: Mapping[str, str] | None 
     """
     if headers and headers.get("cf-mitigated") == "challenge":
         return True
-    if status_code == 403:
+    # Any non-200 is not a page, full stop. This used to enumerate `== 403`, which meant
+    # 429 fell through to the size heuristic below -- and a 429 body is not always small.
+    # Observed live: 429s at ~6KB (correctly rejected) and 429s large enough to clear the
+    # 20KB bar (silently accepted, parsed, and saved as a real post with an empty body).
+    # Enumerating statuses is the bug; the invariant is that a parseable page is a 200.
+    if status_code != 200:
         return True
     # A real page is >100KB. Anything small enough to be an interstitial, that also
     # lacks the payload global, is not a page we can parse.

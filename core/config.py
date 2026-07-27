@@ -58,7 +58,13 @@ class Settings:
     openai_score_model: str = field(default_factory=lambda: os.environ.get("OPENAI_SCORE_MODEL", "gpt-5-nano"))
     openai_expand_effort: str = field(default_factory=lambda: os.environ.get("OPENAI_EXPAND_EFFORT", "high"))
     openai_score_effort: str = field(default_factory=lambda: os.environ.get("OPENAI_SCORE_EFFORT", "low"))
-    openai_expand_max_tokens: int = field(default_factory=lambda: int(os.environ.get("OPENAI_EXPAND_MAX_TOKENS", "24000")))
+    # 24000 was measured as enough and then failed a run: "autoblogging plugin wordpress"
+    # expanded fine once and, on a re-run of the same keyword, burned the whole budget on
+    # reasoning and came back finish_reason=length -- three times, exhausting the actor's
+    # retries and failing the run before discovery. Reasoning length varies per call, so
+    # a cap that only just fits is a coin flip. Unused budget is not billed; a failed run
+    # is. Headroom is the cheaper side of that trade.
+    openai_expand_max_tokens: int = field(default_factory=lambda: int(os.environ.get("OPENAI_EXPAND_MAX_TOKENS", "48000")))
     openai_score_max_tokens: int = field(default_factory=lambda: int(os.environ.get("OPENAI_SCORE_MAX_TOKENS", "8000")))
 
     # --- Anthropic (fallback) -------------------------------------------------
@@ -86,6 +92,11 @@ class Settings:
     # Hard per-run ceiling on discovery spend. A runaway tree or a retry storm is
     # bounded here rather than on the invoice.
     max_queries_per_run: int = field(default_factory=lambda: int(os.environ.get("MAX_QUERIES_PER_RUN", "400")))
+    # LinkedIn returns ~8-10% of leads for ~30-45% of discovery spend (measured across
+    # two keywords; see _query_rows). The LLM writes several LinkedIn queries per leaf
+    # and every one used to be issued. One knob for the one platform that needs it --
+    # do not generalise to a per-platform map until a second platform earns one.
+    linkedin_queries_per_leaf: int = field(default_factory=lambda: int(os.environ.get("LINKEDIN_QUERIES_PER_LEAF", "1")))
     # Proceed to the next stage at this completion fraction. One hung provider must
     # not stall an entire run behind a barrier that never completes.
     barrier_min_completion: float = field(default_factory=lambda: float(os.environ.get("BARRIER_MIN_COMPLETION", "0.95")))
@@ -95,6 +106,15 @@ class Settings:
 
     recency_half_life_days: float = field(default_factory=lambda: float(os.environ.get("RECENCY_HALF_LIFE_DAYS", "180")))
 
+    # Ceiling on the engagement term in _final_score, which multiplies by
+    # (1 + min(log1p(engagement), cap)). 1.0 means a post can at most double its score on
+    # popularity -- reached around 2 upvotes, so engagement separates near-ties and stops
+    # short of overturning a better pain/ICP match. Uncapped, 1,000 upvotes multiplied by
+    # 7.9 and a viral off-target post outranked a quiet perfect one, which also
+    # contradicted treating a crowded thread as un-actionable. Raise only if leads that
+    # deserve the top are being held off it.
+    engagement_cap: float = field(default_factory=lambda: float(os.environ.get("ENGAGEMENT_CAP", "1.0")))
+
     # LinkedIn throttles a single IP under crawl volume, serving login-gated 200s with no
     # post data. Two levers keep fetches under its radar: LinkedIn runs on a dedicated
     # low-concurrency queue (see docker-compose worker-fetch-linkedin), and each fetch
@@ -103,6 +123,45 @@ class Settings:
     # breaker skips the rest rather than hammering a throttled IP for the whole run.
     linkedin_fetch_jitter_ms: int = field(default_factory=lambda: int(os.environ.get("LINKEDIN_FETCH_JITTER_MS", "500")))
     linkedin_throttle_breaker: int = field(default_factory=lambda: int(os.environ.get("LINKEDIN_THROTTLE_BREAKER", "20")))
+
+    # --- x402 / A2MCP (paid agent surface) ------------------------------------
+    # Seller side of the payment protocol: what /a2mcp/* charges, in what token, to
+    # whom. Prices are plain decimal strings in whole USDT -- the same format OKX.AI's
+    # service listing takes -- and are converted to base units when the challenge is
+    # built. Keeping the listed price and the charged price in ONE place is the point:
+    # a listing that says 0.05 and a challenge that says 0.5 is a silent 10x overcharge
+    # that nothing downstream would flag.
+    a2mcp_price_create_job: str = field(default_factory=lambda: os.environ.get("A2MCP_PRICE_CREATE_JOB", "0.05"))
+    a2mcp_price_job_status: str = field(default_factory=lambda: os.environ.get("A2MCP_PRICE_JOB_STATUS", "0.001"))
+
+    # Public https base of THIS service. It goes in the challenge's `resource` and must
+    # match the endpoint registered on-chain -- a buyer that pays for one resource and
+    # replays against another is exactly what `resource` exists to prevent.
+    a2mcp_base_url: str = field(default_factory=lambda: os.environ.get("A2MCP_BASE_URL", ""))
+
+    # Where the money lands. No default: an empty payTo would mint a challenge that
+    # collects for nobody, so the challenge builder refuses rather than guessing.
+    x402_pay_to: str = field(default_factory=lambda: os.environ.get("X402_PAY_TO", ""))
+    # X Layer (196) by default -- it is OKX-native and charges zero gas, so a 0.001 USDT
+    # call is not swamped by its own settlement cost. CAIP-2 is derived, not configured.
+    x402_chain_id: int = field(default_factory=lambda: int(os.environ.get("X402_CHAIN_ID", "196")))
+    x402_asset: str = field(default_factory=lambda: os.environ.get("X402_ASSET", ""))
+    x402_asset_decimals: int = field(default_factory=lambda: int(os.environ.get("X402_ASSET_DECIMALS", "6")))
+    # EIP-712 domain of the asset contract, echoed in `accepts[].extra`. The buyer's
+    # signer reads these to build the typed-data domain; a wrong `name` produces a
+    # signature the facilitator rejects with no useful message.
+    x402_asset_name: str = field(default_factory=lambda: os.environ.get("X402_ASSET_NAME", "USDT"))
+    x402_asset_version: str = field(default_factory=lambda: os.environ.get("X402_ASSET_VERSION", "2"))
+    # How long a minted challenge stays signable.
+    x402_timeout_seconds: int = field(default_factory=lambda: int(os.environ.get("X402_TIMEOUT_SECONDS", "300")))
+
+    # Facilitator that verifies and settles a presented payment. Unset = the paid
+    # surface fails closed (402 on every replay) rather than serving work for free.
+    # See core/x402.py: this is the ONE integration point still to be confirmed against
+    # OKX's facilitator before the service can take real money.
+    x402_facilitator_verify_url: str = field(default_factory=lambda: os.environ.get("X402_FACILITATOR_VERIFY_URL", ""))
+    x402_facilitator_settle_url: str = field(default_factory=lambda: os.environ.get("X402_FACILITATOR_SETTLE_URL", ""))
+    x402_facilitator_api_key: str = field(default_factory=lambda: os.environ.get("X402_FACILITATOR_API_KEY", ""))
 
 
 @lru_cache(maxsize=1)

@@ -8,13 +8,33 @@ pain). Score every pair independently and return one result per `pair_id`.
 
 Separate **"I need this"** from **"here is my think piece about this"**.
 
+The test is **problem ownership**, not question marks. Someone who *has* the problem is
+a lead. Someone curious *about* the problem is an audience.
+
 `true` — the author has the problem and wants it gone:
-- asks a question, however rhetorically
 - describes their own broken workflow, in first person
 - says what they tried and why it failed
 - asks for a recommendation, comparison, or alternative
+- asks what to *do* about a situation they are stuck in
 
 `false` — everything else, and most posts are everything else:
+- **impersonal or informational questions.** The second big one. "How does X work",
+  "What is Y", "Is Z good for W", "Will A replace B" — these are research, not demand.
+  The author is learning about a topic, not stuck on a task. Nothing is broken for them,
+  so there is nothing to sell them. A question mark is not intent.
+
+  Calibrated on two real Quora titles from this pipeline:
+
+  > "I am struggling to rewrite AI-generated text to make it original. What should I
+  > do?" — `is_seeking: true`. First person, a named task, a stated failure, an explicit
+  > ask. This person would buy a tool today.
+
+  > "How does AI impact SEO and Google rankings?" — `is_seeking: false`. Nobody owns a
+  > problem here. It is a topic, phrased as a question. Answering it wins a thank-you,
+  > not a customer.
+
+  Both contain the same keywords and both end in a question mark. The difference is
+  whether a *person* is stuck. Score that, not the grammar.
 - **selling, promoting, or announcing.** This is the big one. Vendors write in the
   exact pain language you are matching on, because that is what marketing is. A post
   that opens "Looking for a tool that builds relationships?" and closes "Contact me
@@ -75,6 +95,10 @@ or `actionable` is false, return an empty string rather than inventing a pitch.
 Be strict. A false positive costs a human being's attention when they follow the link
 and find an ad. Under-scoring loses one lead; over-scoring poisons trust in the whole
 list. When torn between two bands, take the lower one.
+
+The output is a list someone will personally reply to, hoping to sell something. The
+question behind every score is therefore not "is this on topic" but **"is this person a
+potential customer right now"**. A well-matched informational question is still a zero.
 
 Return strict JSON matching the schema. One result per input pair, no extras, no
 omissions.

@@ -23,6 +23,7 @@ import numpy as np
 
 from core.broker import broker, redis_client  # noqa: F401  -- broker import sets the global broker
 from core.config import settings
+from core.limits import rate_limited
 from core.urls import NotCanonicalizable, canonicalize, platform_of, url_hash
 from llm import client as llm
 from llm import embeddings
@@ -33,7 +34,7 @@ from pipeline.stages import arrive, fan_out
 log = logging.getLogger(__name__)
 
 SCORE_BATCH_SIZE = 10
-PLATFORMS = ("quora", "linkedin")  # reddit deferred: no obtainable credentials, see plan §7
+PLATFORMS = ("quora", "linkedin", "reddit")  # quora is SERP-only -- see _from_serp
 
 
 # --- 1. expand ---------------------------------------------------------------------
@@ -105,7 +106,20 @@ def _compile_queries(run_id: str, leaf_id: str, leaf: dict) -> list[dict]:
     """
     rows: list[dict] = []
     for platform in PLATFORMS:
-        for q in leaf.get("queries", {}).get(platform, []):
+        queries = leaf.get("queries", {}).get(platform, [])
+        # LinkedIn buys the least per credit of the three, measured across two keywords:
+        #
+        #     "autoblogging plugin wordpress"      207 candidates ->  1 of 13 leads
+        #     "ai seo friendly content generator"  299 candidates -> 11 of 108 leads
+        #
+        # ~30-45% of discovery spend for ~8-10% of leads, and it is also the most
+        # expensive platform to fetch (its own queue, jitter, circuit breaker). That is
+        # structural rather than unlucky: LinkedIn is where people announce wins, and
+        # this pipeline looks for people with problems. Capped rather than dropped --
+        # it still produces leads, and two keywords is not enough to delete a platform.
+        if platform == "linkedin":
+            queries = queries[:settings().linkedin_queries_per_leaf]
+        for q in queries:
             q = q.strip()
             if not q:
                 continue
@@ -151,7 +165,15 @@ def run_query(run_id: str, query_id: str) -> None:
         # Serper primary, SerpApi fallback -- see discovery/providers.py. A permanent
         # error means every configured provider rejected the request (bad keys), so
         # fail fast; retryable errors propagate to the retry middleware.
-        results = discovery.search(query["q"], query["platform"], depth=query["depth"])
+        #
+        # The limiter is not optional here: the discover queue runs 2 processes x 16
+        # threads while Serper's own /account reports rateLimit 5/s, so an unpaced
+        # fan-out sends ~32 concurrent requests into a 5/s ceiling. Those come back 429
+        # -> retryable -> three retries each -> query_failed, and a run loses queries to
+        # its own concurrency rather than to anything Serper did. rate_limited raises
+        # dramatiq's Retry, which requeues WITHOUT consuming the retry budget.
+        with rate_limited("serper.dev"):
+            results = discovery.search(query["q"], query["platform"], depth=query["depth"])
     except discovery.DiscoveryPermanentError as exc:
         _fail_query(run_id, query_id, str(exc))
         return
@@ -235,14 +257,20 @@ def _arrive_fetch(run_id: str, candidate_id: str) -> None:
 
 @dramatiq.actor(queue_name="fetch", max_retries=3, on_retry_exhausted="fetch_failed", time_limit=120_000)
 def fetch_candidate(run_id: str, candidate_id: str) -> None:
-    """Fetch a non-LinkedIn candidate (Quora). Plain HTTP -- no browser in this pipeline."""
+    """Fetch a non-LinkedIn candidate: Reddit enriches from .json, Quora reads its SERP row.
+
+    Plain HTTP on this path. The only browser in the stack mints Reddit's cookie jar in a
+    child process (``scrape/reddit.py``), never to render a page for scraping.
+    """
     candidate = repo.get_candidate(candidate_id)
     if candidate is None:
         _arrive_fetch(run_id, candidate_id)  # vanished, but still a barrier party
         return
 
-    if candidate["platform"] == "quora":
-        _fetch_quora(candidate_id, candidate["url"])
+    if candidate["platform"] == "reddit":
+        _fetch_reddit(candidate_id, candidate)
+    elif candidate["platform"] == "quora":
+        _from_serp(candidate_id, candidate)
     else:
         repo.save_fetched(candidate_id, None, None, None, 0, None, "skipped",
                           error=f"no fetcher for {candidate['platform']}")
@@ -286,31 +314,101 @@ def _bump_linkedin_throttle(run_id: str) -> int:
     return int(count)
 
 
-def _fetch_quora(candidate_id: str, url: str) -> None:
-    from scrape import quora
+def _from_serp(candidate_id: str, candidate: dict) -> None:
+    """The SERP result *is* the content: Quora always, Reddit as a fallback.
 
-    status, html, headers = quora.fetch(url)
-    if quora.is_challenge(html, status, headers):
-        # Raise so the retry middleware backs off. Quora's 403s are short-lived per-IP
-        # penalty windows and are not URL-sticky -- the same URL succeeds minutes later.
-        # Never tight-loop; that just burns the same window.
-        raise RuntimeError(f"quora challenge ({status}) for {url}")
+    Reddit used to live here permanently, on the finding that every anonymous surface is
+    gated -- 200 with a "Please wait for verification" interstitial on ``www``, 403 on
+    ``old`` and on ``.json``, even under curl_cffi's Chrome TLS fingerprint. That was
+    measured with one client and generalised too far: the gate is *state*, not
+    fingerprint, and a cookie jar clears it (see ``scrape/reddit.py``). Reddit now
+    enriches through ``_fetch_reddit`` and only lands here when the jar fails, which
+    keeps a stale jar or a Reddit change costing exactly today's behaviour and no more.
 
-    page = quora.parse(html, url)
-    if not page.body:
+    Quora is here permanently, after the fetch stopped paying for itself. Its gate is now a
+    *quota*, not a rate: pacing bought nothing, and only ~36 minutes of near-idle ever
+    restored partial service. Rotating IPs does not buy past it either -- measured, one
+    request per fresh IP: 0/25 datacenter (403 on the first request, ASN reputation) and
+    2/15 residential, which retrying across 8 sessions per URL lifted only to 4/12. At
+    ~5% per attempt, usable coverage needs ~45 attempts per URL.
+
+    That costs less than it looks, because the fetch was retrieving something we already
+    had. ``scrape/quora.py`` embeds ``embed_text`` -- the *question*, not the answer pile
+    -- and the question is what the SERP title already carries; 270/270 Quora rows in the
+    last full run had both a title and a snippet. The snippet rides along as
+    disambiguating context for short titles, capped so it cannot dominate.
+
+    Never raises: there is no transient failure mode to retry when no request is made.
+
+    ponytail: rows landing here carry no posted_at/engagement/answers_total, so recency
+    decay and the saturation filter are inert for them -- they score at the neutral 0.5
+    recency. Both vendors return a `date` on organic results; add it to SerpResult if
+    recency starts mattering for Quora. To get Quora's engagement and answer_count back,
+    fetch the ~13% that survive the prefilter rather than all of them (36 requests, not
+    270) -- ``scrape/quora.py`` still has the fetcher and ``core/limits.py`` its pacing.
+    """
+    title, snippet = candidate.get("title"), candidate.get("snippet")
+    text = "\n\n".join(p for p in (title, snippet) if p)
+    if not text:
+        # A SERP row with neither title nor snippet is nothing to embed. 'empty', not
+        # a failure -- the fetch did exactly what it could.
         repo.save_fetched(candidate_id, None, None, None, 0, None, "empty")
+        return
+    repo.save_fetched(candidate_id, text, None, None, 0, None, "ok")
+
+
+def _fetch_reddit(candidate_id: str, candidate: dict) -> None:
+    """Enrich a Reddit candidate from its ``.json``, or fall back to the SERP row.
+
+    Never raises and never records a failure. Enrichment here is strictly *additive*:
+    the worst outcome is exactly what ``_from_serp`` would have produced on its own, so
+    a stale jar, a Reddit change or a single bad response costs detail, not a candidate.
+    That is deliberate -- reddit supplies most of this pipeline's leads, and a fetch
+    layer that can turn them into `failed` rows is a worse trade than one that quietly
+    degrades.
+
+    One retry with a replacement jar on a gated response. A jar is not a permanent key --
+    measured, a session serves about 30 fetches and then 429s on everything -- so on a run
+    of a few hundred Reddit candidates a dead jar is the normal case, hit roughly once per
+    30 URLs, not an exception. Handing the dead jar to ``reddit.jar`` is what keeps that
+    from costing a browser launch per gated fetch.
+    """
+    from scrape import reddit
+
+    url = candidate["url"]
+    if not reddit.post_id(url):
+        _from_serp(candidate_id, candidate)     # not a post permalink; nothing to fetch
+        return
+
+    page, used = None, None
+    for attempt in (1, 2):
+        try:
+            used = reddit.jar(stale=used)
+            with rate_limited("reddit.com"):
+                status, text = reddit.fetch(url, used)
+        except Exception as exc:                # network, playwright, redis -- all equal here
+            log.warning("reddit fetch failed for %s: %s", url, exc)
+            break
+        if not reddit.is_gated(status, text):
+            page = reddit.parse(text, url)
+            break
+        if attempt == 1:
+            log.info("reddit gated (%s) for %s; replacing jar", status, url)
+
+    if page is None or not page.body:
+        _from_serp(candidate_id, candidate)
         return
 
     repo.save_fetched(
         candidate_id,
-        body=page.embed_text,       # the question -- see scrape/quora.py on why not `body`
+        body=page.body,             # title + selftext: the real post, not a SERP snippet
         author=None,                # deliberately not collected: rank the post, never the person
-        posted_at=page.posted_at,
-        engagement=page.engagement,
+        posted_at=page.posted_at,   # real recency, replacing the 0.5 unknown-date default
+        engagement=page.ups or 0,   # reach
         raw_key=None,
         status="ok",
-        answers_seen=page.answers_seen,
-        answers_total=page.answer_count,   # the completeness oracle + the saturation signal
+        answers_seen=None,          # comment bodies are not fetched
+        answers_total=page.num_comments,   # saturation -> the scorer's existing_answer_count
     )
 
 
@@ -512,12 +610,31 @@ def score_batch(run_id: str, batch_index: int) -> None:
 
 
 def _final_score(s: dict, pair: dict) -> float:
-    """final = pain * icp * recency_decay * log1p(engagement)
+    """final = pain * icp * recency_decay * (1 + min(log1p(engagement), cap))
 
     is_seeking and actionable are hard gates rather than factors. A vendor's ad and a
     dead thread are not weak leads to be ranked low -- they are not leads, and letting
     a strong pain_match drag them up the list is exactly the failure that makes a
     results page untrustworthy.
+
+    **Why engagement is capped.** This pipeline holds two beliefs about a busy thread and
+    they point in opposite directions. ``answers_total`` is handed to the scorer as
+    ``existing_answer_count`` precisely so that a crowded thread is judged *not*
+    actionable -- there is no room left for a useful reply. Meanwhile an uncapped
+    ``log1p(engagement)`` rewards exactly that crowding: 1,000 upvotes multiplies by 7.9
+    while a perfect-fit post with 5 upvotes gets 2.8, so popularity can outrank fit.
+    The contradiction was invisible while reddit's engagement was always 0 and only
+    LinkedIn carried a number. Reddit now carries real ones, so it had to be resolved.
+
+    The resolution is two-part. The signals are *split* at the source -- upvotes are
+    reach and land in ``engagement``, comments are saturation and land in
+    ``answers_total`` (see ``_fetch_reddit``) -- and what survives is bounded here, so
+    engagement can order two comparable leads without overturning a better match.
+
+    First run with real Reddit engagement behaved as intended: the top lead was a 24-upvote
+    post scoring 0.898 on pain 90 / icp 70, while the run's most-upvoted post (325) scored
+    0 -- it was a tool-recommendation thread, so the gates killed it before any multiplier
+    was reached.
     """
     if not s["is_seeking"] or not s["actionable"]:
         return 0.0
@@ -534,7 +651,8 @@ def _final_score(s: dict, pair: dict) -> float:
         # creation time. Neutral-ish rather than 1.0: we cannot verify it is fresh.
         recency = 0.5
 
-    engagement = math.log1p(max(pair.get("engagement") or 0, 0))
+    engagement = min(math.log1p(max(pair.get("engagement") or 0, 0)),
+                     settings().engagement_cap)
     return round(pain * icp * recency * (1 + engagement), 6)
 
 
