@@ -18,15 +18,19 @@ from redis.exceptions import RedisError
 
 from core import limits
 
+# Host as well as port, because the suite has to run where the app runs. From the host
+# compose publishes redis on 127.0.0.1:6380; from inside a container it is redis:6379,
+# and a hardcoded localhost cannot be pointed at it by any amount of configuration.
+REDIS_HOST = os.environ.get("TEST_REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("TEST_REDIS_PORT", "6380"))
 
 
 @pytest.fixture(autouse=True)
 def _redis_up():
     try:
-        Redis(host="localhost", port=REDIS_PORT, socket_connect_timeout=3).ping()
+        Redis(host=REDIS_HOST, port=REDIS_PORT, socket_connect_timeout=3).ping()
     except RedisError as exc:
-        pytest.fail(f"redis unavailable on :{REDIS_PORT} ({exc})")
+        pytest.fail(f"redis unavailable on {REDIS_HOST}:{REDIS_PORT} ({exc})")
 
 
 @pytest.fixture

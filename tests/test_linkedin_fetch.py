@@ -20,6 +20,9 @@ from redis.exceptions import RedisError
 from pipeline import actors
 from scrape import linkedin
 
+# See tests/test_limits.py: host is configurable too, so the suite runs both from the
+# host (127.0.0.1:6380) and from inside a container (redis:6379).
+REDIS_HOST = os.environ.get("TEST_REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("TEST_REDIS_PORT", "6380"))
 
 _REAL_POST_LDJSON = (
@@ -41,9 +44,9 @@ _GATED_PAGE = (
 @pytest.fixture(autouse=True)
 def _redis_up():
     try:
-        Redis(host="localhost", port=REDIS_PORT, socket_connect_timeout=3).ping()
+        Redis(host=REDIS_HOST, port=REDIS_PORT, socket_connect_timeout=3).ping()
     except RedisError as exc:
-        pytest.fail(f"redis unavailable on :{REDIS_PORT} ({exc})")
+        pytest.fail(f"redis unavailable on {REDIS_HOST}:{REDIS_PORT} ({exc})")
 
 
 @pytest.fixture(autouse=True)
@@ -72,7 +75,7 @@ def saved(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
 def run_id() -> str:
     rid = f"litest-{uuid.uuid4()}"
     yield rid
-    Redis(host="localhost", port=REDIS_PORT, decode_responses=True).delete(f"linkedin_throttle:{rid}")
+    Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True).delete(f"linkedin_throttle:{rid}")
 
 
 def _mock_fetch(monkeypatch: pytest.MonkeyPatch, html: str, status: int = 200) -> None:
