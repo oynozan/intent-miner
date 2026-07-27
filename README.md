@@ -74,7 +74,7 @@ so this stack can run alongside the sibling `bg-remover` stack, which binds 6379
 
 ```bash
 docker compose exec -T postgres psql -U intent -d intent_miner -c "\dt"
-pytest    # 173 tests; needs redis on 6380
+pytest    # 172 tests; needs redis on 6380
 ```
 
 ## What the research changed
@@ -296,32 +296,35 @@ routes that an internal refactor cannot quietly reshape.
 | Create a job from a keyword | `/a2mcp/jobs` | POST | **0.05 USDT** |
 | Job status + discovered links | `/a2mcp/jobs/status?job_id=…` | GET | **0.001 USDT** |
 
-A call with no `PAYMENT-SIGNATURE` returns **402** with the challenge in
-`PAYMENT-REQUIRED` (base64) *and* in the body; pay it, replay, and the response carries a
-`PAYMENT-RESPONSE` receipt. Status is 50× cheaper than create on purpose — a buyer
-polling a job they already paid for should not be charged like they are starting another.
+A call with no payment returns **402** with the challenge; pay it, replay, and the
+response carries a settlement receipt. Status is 50× cheaper than create on purpose — a
+buyer polling a job they already paid for should not be charged like they are starting
+another.
 
 **The status service takes `job_id` as a query param, not a path segment.** A listing
 stores one fixed URL, so `/a2mcp/jobs/{id}` could not be registered; the buyer-side
 `payment quote <url> --param job_id=…` puts known params in the query string for GET.
-Same reason the create service declares `"method": "POST"` in its `outputSchema` — the
-buyer probes with GET by default, and an undeclared POST endpoint answers 405 and reads
-as unreachable rather than as priced.
 
-**One integration is still open: the facilitator.** Verifying that a presented signature
-is real, funded and unspent needs the service that holds the on-chain view, and the
-`onchainos payment` CLI is buyer-side only (pay / quote / decode-receipt / pay-local /
-a2a-pay / charge / session / subscription — no `verify`). `core/x402.py` implements the
-public x402 facilitator contract (`POST /verify`, `POST /settle`, with `paymentPayload` +
-`paymentRequirements`); point `X402_FACILITATOR_VERIFY_URL` / `_SETTLE_URL` at OKX's
-facilitator and confirm those field names before taking real money.
+**The protocol is not ours.** `okxweb3-app-x402` mints the challenge, verifies the
+presented payment against OKX's broker and settles it; `core/x402.py` only decides what
+each route costs and installs the middleware. This file previously hand-rolled
+`/verify` + `/settle` from buyer-side documentation, and that was wrong in the way that
+matters: the broker authenticates with **HMAC-SHA256 request signing**, which the buyer
+docs never mention. It would have failed closed forever while looking like a
+configuration problem. If a route ever needs a price or a scheme the SDK does not
+expose, add it to the SDK's config — do not reintroduce a second implementation, because
+then the listed price and the charged price have two places to disagree.
 
-Until then the paid surface **fails closed** — a presented payment it cannot verify gets
-a 500, never the work. There is deliberately no bypass flag: the alternative failure mode
-is a service that hands out paid work for free and looks perfectly healthy doing it. Note
-the asymmetry in `core/x402.py` — a *malformed or rejected* payment is a 402 ("pay me"),
-but *our* inability to verify is a 500, because telling a buyer who already paid to pay
-again is the wrong side to fail on.
+Settlement is **synchronous** (`OKX_SYNC_SETTLE`): the payment lands before the job is
+queued. Async would hand over work whose payment had not settled, and a job is not
+recoverable once the pipeline has spent LLM and SERP credits running it.
+
+Without `OKX_API_KEY` / `OKX_SECRET_KEY` / `OKX_PASSPHRASE` / `X402_PAY_TO` the gate is
+never installed and both routes **503**, naming the missing settings. That is deliberate
+and there is no bypass flag: the alternative failure mode is a deployment that serves
+paid work for free and looks perfectly healthy doing it. Note the distinction — an
+unpaid call is a 402 ("pay me"), but *our* being unable to collect is a 503, because
+inviting payment to a service with no configured payee takes money nobody can settle.
 
 ### The listing itself
 
@@ -363,13 +366,13 @@ by keyword.
 ```
 api/          FastAPI surface: routes.py (free /runs), a2mcp.py (paid, x402-priced)
 core/         config, db, redis broker, barriers, rate limits, budget, url canonicalization,
-              x402.py (seller side: mint the 402 challenge, verify the paid replay)
+              x402.py (route pricing + installs OKX's payment middleware)
 discovery/    providers.py (Serper->SerpApi), serper.py, serpapi.py, common.py  (Exa declined)
 llm/          client.py, embeddings.py, prompts/{expand,score}.md
 pipeline/     actors.py, stages.py, prefilter.py, repo.py
 scrape/       quora.py (parser kept; fetch retired -- SERP-only), linkedin.py,
               reddit.py (cookie-jar mint + .json fetch; the only browser in the stack)
-tests/        173 tests; fixtures/ are live captures, not mocks
+tests/        172 tests; fixtures/ are live captures, not mocks
 ```
 
 ## Next

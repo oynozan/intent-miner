@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 
 from api.a2mcp import router as a2mcp_router
 from api.routes import router
@@ -76,28 +75,11 @@ app = FastAPI(
 app.include_router(router)
 app.include_router(a2mcp_router)
 
-
-@app.exception_handler(x402.PaymentRequired)
-def _payment_required(request: Request, exc: x402.PaymentRequired) -> JSONResponse:
-    """402 carrying the challenge in BOTH places a buyer looks.
-
-    `PAYMENT-REQUIRED` is the x402 v2 signal and is what gets read first; the same JSON
-    sits in the body because v1 clients look there, and because a human curling the
-    endpoint should be able to see the price without base64-decoding a header.
-    """
-    return JSONResponse(
-        status_code=402,
-        content=exc.challenge | ({"error": exc.reason} if exc.reason else {}),
-        headers={x402.PAYMENT_REQUIRED_HEADER: x402.challenge_header(exc.challenge)},
-    )
-
-
-@app.exception_handler(x402.Misconfigured)
-def _misconfigured(request: Request, exc: x402.Misconfigured) -> JSONResponse:
-    """500, never 402. Telling a buyer to pay a service that cannot collect or cannot
-    verify is worse than telling them it is broken."""
-    logging.getLogger(__name__).error("x402 seller misconfigured: %s", exc)
-    return JSONResponse(status_code=500, content={"detail": "payment surface is not configured"})
+# Gate /a2mcp/* on payment. Must come after the routers: the middleware matches on
+# "<METHOD> <path>" strings, so the paths have to exist for it to guard anything.
+# Returns False and logs the missing settings when unconfigured, in which case the
+# routes refuse calls themselves rather than serving paid work for free.
+x402.install(app)
 
 
 @app.get("/health", tags=["health"], summary="Liveness check")

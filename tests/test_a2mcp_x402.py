@@ -1,16 +1,16 @@
-"""The paid surface: what a buyer is actually charged, and what we do when we cannot
-verify a payment.
+"""The paid surface: that it charges the listed price, and that it never works for free.
 
-Minting the 402 challenge is the only part of x402 this service owns end to end --
-settlement belongs to a facilitator -- so these tests pin the two failures that would
-cost real money without looking like errors: charging an amount that is not the listed
-price, and serving paid work that was never proven paid.
+Protocol mechanics -- challenge format, signing, settlement -- belong to
+``okxweb3-app-x402`` and are its tests to write, not ours. What is ours is the wiring
+around it, and the two ways that wiring can lose money without erroring:
+
+1. charging an amount that is not the price registered on-chain, and
+2. serving the work when the payment gate was never installed.
+
+Both are tested here. Neither shows up as a failure in production.
 """
 
 from __future__ import annotations
-
-import base64
-import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,146 +18,120 @@ from fastapi.testclient import TestClient
 from core import x402
 from core.config import settings
 
+CREDS = {
+    "OKX_API_KEY": "test-key",
+    "OKX_SECRET_KEY": "test-secret",
+    "OKX_PASSPHRASE": "test-passphrase",
+    "X402_PAY_TO": "0x25a39c21b29b80df5b7fc59286aa7dc6f10f9c13",
+}
+
 
 @pytest.fixture
-def configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A fully-configured seller, except the facilitator (set per-test)."""
-    monkeypatch.setenv("A2MCP_BASE_URL", "https://miner.example.com")
-    monkeypatch.setenv("A2MCP_PRICE_CREATE_JOB", "0.05")
-    monkeypatch.setenv("A2MCP_PRICE_JOB_STATUS", "0.001")
-    monkeypatch.setenv("X402_PAY_TO", "0x25a39c21b29b80df5b7fc59286aa7dc6f10f9c13")
-    monkeypatch.setenv("X402_ASSET", "0x1e4a5963abfd975d8c9021ce480b42188849d41d")
-    monkeypatch.setenv("X402_CHAIN_ID", "196")
-    monkeypatch.setenv("X402_ASSET_DECIMALS", "6")
-    monkeypatch.setenv("X402_FACILITATOR_VERIFY_URL", "")
-    monkeypatch.setenv("X402_FACILITATOR_SETTLE_URL", "")
+def unconfigured(monkeypatch: pytest.MonkeyPatch):
+    """No credentials -- the state a fresh deployment is in before .env is filled."""
+    for key in CREDS:
+        monkeypatch.delenv(key, raising=False)
     settings.cache_clear()
     yield
     settings.cache_clear()
 
 
 @pytest.fixture
-def client(configured: None) -> TestClient:
+def configured(monkeypatch: pytest.MonkeyPatch):
+    for key, value in CREDS.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("A2MCP_PRICE_CREATE_JOB", "0.05")
+    monkeypatch.setenv("A2MCP_PRICE_JOB_STATUS", "0.001")
+    monkeypatch.setenv("X402_CHAIN_ID", "196")
+    settings.cache_clear()
+    yield
+    settings.cache_clear()
+
+
+# --- the price actually charged --------------------------------------------------
+
+def test_routes_charge_the_listed_prices(configured) -> None:
+    """The listing on-chain says 0.05 and 0.001. If these drift, the marketplace
+    advertises one price while the endpoint quotes another and nothing errors."""
+    routes = x402.routes()
+
+    create = routes[x402.CREATE_ROUTE].accepts[0]
+    status = routes[x402.STATUS_ROUTE].accepts[0]
+
+    assert create.price == "$0.05"
+    assert status.price == "$0.001"
+
+
+def test_status_stays_far_cheaper_than_creating(configured) -> None:
+    """Polling a job you already paid for must not cost like starting another one."""
+    routes = x402.routes()
+    create = float(routes[x402.CREATE_ROUTE].accepts[0].price.lstrip("$"))
+    status = float(routes[x402.STATUS_ROUTE].accepts[0].price.lstrip("$"))
+    assert create == pytest.approx(50 * status)
+
+
+def test_both_routes_settle_on_x_layer_to_the_configured_payee(configured) -> None:
+    routes = x402.routes()
+    for route in (x402.CREATE_ROUTE, x402.STATUS_ROUTE):
+        option = routes[route].accepts[0]
+        assert option.network == "eip155:196"
+        assert option.pay_to == CREDS["X402_PAY_TO"]
+        assert option.scheme == "exact"
+
+
+def test_route_keys_match_the_real_paths(configured) -> None:
+    """The SDK matches on these exact strings. A renamed path silently un-gates the
+    route -- it does not 404, it becomes free."""
+    from api.a2mcp import router
+
+    paths = {f"{method} {r.path}" for r in router.routes for method in r.methods if method != "HEAD"}
+    assert x402.CREATE_ROUTE in paths
+    assert x402.STATUS_ROUTE in paths
+
+
+# --- never free ------------------------------------------------------------------
+
+def test_unconfigured_refuses_instead_of_building_routes(unconfigured) -> None:
+    assert not x402.configured()
+    with pytest.raises(x402.Misconfigured):
+        x402.routes()
+
+
+def test_missing_names_every_absent_setting(unconfigured) -> None:
+    """A 503 that does not say what is missing costs someone an afternoon."""
+    assert set(x402.missing()) == set(CREDS)
+
+
+def test_a_payee_alone_is_not_enough(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Credentials without a payee, or a payee without credentials, are both unable to
+    collect -- neither may be treated as configured."""
+    monkeypatch.setenv("X402_PAY_TO", CREDS["X402_PAY_TO"])
+    for key in ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE"):
+        monkeypatch.delenv(key, raising=False)
+    settings.cache_clear()
+    assert not x402.configured()
+    settings.cache_clear()
+
+
+def test_unconfigured_serves_no_paid_work(unconfigured, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The failure this whole arrangement exists to prevent. With no payment gate
+    installed, a create call must NOT reach the pipeline -- an unconfigured deployment
+    would otherwise run jobs, and spend real LLM and SERP credits, for free."""
+    from pipeline import repo
+
+    monkeypatch.setattr(repo, "create_run", lambda *a, **k: pytest.fail("ran a job for free"))
+
     from api.main import app
 
-    return TestClient(app)
+    response = TestClient(app).post("/a2mcp/jobs", json={"keyword": "background removal"})
+    assert response.status_code == 503
 
 
-def _challenge_from(response) -> dict:
-    """Read the challenge back the way a buyer does -- out of the header, not the body."""
-    return json.loads(base64.b64decode(response.headers[x402.PAYMENT_REQUIRED_HEADER]))
+def test_unconfigured_is_not_reported_as_402(unconfigured) -> None:
+    """402 means "pay me". Inviting payment to a service with no payee configured
+    would take money nobody can settle."""
+    from api.main import app
 
-
-# --- amounts -----------------------------------------------------------------------
-
-def test_price_converts_exactly_at_six_decimals() -> None:
-    """The whole reason this uses Decimal. `int(0.05 * 10**6)` is 49999 -- a silent
-    one-unit underprice on every single call."""
-    assert x402.to_base_units("0.05", 6) == "50000"
-    assert x402.to_base_units("0.001", 6) == "1000"
-    assert x402.to_base_units("0", 6) == "0"
-
-
-def test_a_price_the_token_cannot_express_is_rejected_not_rounded() -> None:
-    """Truncating here would charge a different price than the one listed on-chain."""
-    with pytest.raises(x402.Misconfigured):
-        x402.to_base_units("0.0000001", 6)
-
-
-def test_a_challenge_without_a_payee_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty payTo mints a challenge that collects for nobody -- the buyer pays and
-    the money goes nowhere. Refuse to build it rather than emit it."""
-    monkeypatch.setenv("A2MCP_BASE_URL", "https://miner.example.com")
-    monkeypatch.setenv("X402_PAY_TO", "")
-    monkeypatch.setenv("X402_ASSET", "0xabc")
-    settings.cache_clear()
-    with pytest.raises(x402.Misconfigured):
-        x402.challenge("/a2mcp/jobs", "0.05", {"type": "http", "method": "POST"}, "d")
-    settings.cache_clear()
-
-
-# --- the challenge a buyer reads ---------------------------------------------------
-
-def test_creating_a_job_unpaid_returns_402_priced_at_the_listed_amount(client: TestClient) -> None:
-    response = client.post("/a2mcp/jobs", json={"keyword": "video background removal"})
-    assert response.status_code == 402
-
-    accepts = _challenge_from(response)["accepts"][0]
-    assert accepts["amount"] == "50000"          # 0.05 USDT at 6 dp
-    assert accepts["payTo"] == "0x25a39c21b29b80df5b7fc59286aa7dc6f10f9c13"
-    assert accepts["network"] == "eip155:196"
-    assert accepts["scheme"] == "exact"
-
-
-def test_job_status_is_priced_fifty_times_cheaper_than_creating_one(client: TestClient) -> None:
-    """The two services are deliberately not the same price -- polling must stay cheap
-    enough that a buyer is not punished for watching a job they already paid for."""
-    create = _challenge_from(client.post("/a2mcp/jobs", json={"keyword": "background removal"}))
-    status = _challenge_from(client.get("/a2mcp/jobs/status", params={"job_id": "x"}))
-
-    assert int(create["accepts"][0]["amount"]) == 50 * int(status["accepts"][0]["amount"])
-
-
-def test_the_create_challenge_declares_post(client: TestClient) -> None:
-    """`payment quote` probes with GET unless the challenge says otherwise. Omit this
-    and a buyer's very first probe gets 405 and reads as an unreachable endpoint."""
-    accepts = _challenge_from(client.post("/a2mcp/jobs", json={"keyword": "background removal"}))["accepts"][0]
-    assert accepts["outputSchema"]["input"]["method"] == "POST"
-    assert "keyword" in accepts["outputSchema"]["input"]["body"]["required"]
-
-
-def test_the_status_challenge_declares_job_id_as_a_query_param(client: TestClient) -> None:
-    """A registered endpoint URL is static, so the job id has to ride in the query
-    string -- a path segment could not be expressed in the on-chain listing."""
-    accepts = _challenge_from(client.get("/a2mcp/jobs/status", params={"job_id": "x"}))["accepts"][0]
-    schema = accepts["outputSchema"]["input"]
-    assert schema["method"] == "GET"
-    assert "job_id" in schema["queryParams"]["required"]
-
-
-def test_the_challenge_is_in_the_body_too(client: TestClient) -> None:
-    """v1 buyers read the body; humans curling the endpoint should see a price without
-    base64-decoding a header."""
-    response = client.post("/a2mcp/jobs", json={"keyword": "background removal"})
-    assert response.json()["x402Version"] == 2
-    assert response.json()["accepts"] == _challenge_from(response)["accepts"]
-
-
-# --- fail closed -------------------------------------------------------------------
-
-def test_a_payment_we_cannot_verify_never_becomes_free_work(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The failure this whole module is shaped around. With no facilitator configured a
-    presented payment is unverifiable, so the call must fail -- NOT quietly succeed and
-    queue a run that nobody paid for."""
-    from pipeline import repo
-
-    def _boom(*args, **kwargs):
-        raise AssertionError("a run was created for an unverified payment")
-
-    monkeypatch.setattr(repo, "create_run", _boom)
-
-    response = client.post(
-        "/a2mcp/jobs",
-        json={"keyword": "background removal"},
-        headers={x402.PAYMENT_SIGNATURE_HEADER: base64.b64encode(b'{"scheme":"exact"}').decode()},
-    )
-    assert response.status_code == 500
-
-
-def test_an_unverifiable_payment_is_not_reported_as_402(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """402 means "pay me". Telling a buyer who already paid to pay again, because *we*
-    have no facilitator, is the wrong side to fail on."""
-    from pipeline import repo
-
-    monkeypatch.setattr(repo, "create_run", lambda *a, **k: "never")
-
-    response = client.post(
-        "/a2mcp/jobs",
-        json={"keyword": "background removal"},
-        headers={x402.PAYMENT_SIGNATURE_HEADER: base64.b64encode(b"{}").decode()},
-    )
+    response = TestClient(app).get("/a2mcp/jobs/status", params={"job_id": "x"})
+    assert response.status_code == 503
     assert response.status_code != 402
