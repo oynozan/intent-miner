@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .env
 .pytest_cache/
+
+# Per-run CSV exports. Reproducible from the database, and they carry scraped post
+# bodies and author handles -- not something to commit.
+exports/

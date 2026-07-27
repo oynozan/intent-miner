@@ -1,6 +1,12 @@
 # Host ports are deliberately non-default: the sibling bg-remover stack binds
 # 6379 (redis) and 9000/9001 (minio). These offsets let both run at once.
 # Inside the compose network everything uses standard ports.
+#
+# Every published port binds 127.0.0.1 explicitly. Docker's default is 0.0.0.0, which
+# on a public host would expose Postgres (password `intent`), an unauthenticated Redis,
+# MinIO on default credentials, and the free /runs API -- and Docker publishes ports by
+# writing its own iptables rules, so a host firewall like UFW does not cover them.
+# Anything reachable from outside must arrive through the reverse proxy.
 
 services:
   postgres:
@@ -10,7 +16,7 @@ services:
       POSTGRES_PASSWORD: intent
       POSTGRES_DB: intent_miner
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
@@ -23,7 +29,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6380:6379"
+      - "127.0.0.1:6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -37,8 +43,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     ports:
-      - "9002:9000"
-      - "9003:9001"
+      - "127.0.0.1:9002:9000"
+      - "127.0.0.1:9003:9001"
     volumes:
       - miniodata:/data
     healthcheck:
@@ -68,7 +74,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       S3_ENDPOINT: http://minio:9000
     ports:
-      - "8001:8000"
+      # Loopback only -- nginx is the sole public door, and it exposes /a2mcp/* alone.
+      # Published on 0.0.0.0 this would serve the free /runs API next to the paid one:
+      # same pipeline, same LLM and SERP spend, no payment.
+      - "127.0.0.1:8001:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -95,9 +104,13 @@ services:
     volumes:
       - .:/app
 
+  # Sized to the SERP ceiling, not to the CPU. Serper allows 5 requests/second, so the
+  # old 2x16=32 threads could not do more work -- they just queued 28 rate-limit
+  # requeues per second behind the 4 that got through. 6 threads at ~0.3-0.6s/call
+  # saturates 4/s with headroom for a slow response.
   worker-discover:
     build: .
-    command: dramatiq worker worker --processes 2 --threads 16 --queues discover
+    command: dramatiq worker worker --processes 1 --threads 6 --queues discover
     env_file: .env
     environment: *worker_env
     depends_on:
