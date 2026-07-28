@@ -46,6 +46,23 @@ def merge_stats(run_id: str, patch: dict[str, Any]) -> None:
 
 
 def get_run(run_id: str) -> dict[str, Any] | None:
+    """The run, or None when there is no such run -- including when `run_id` could not
+    name one.
+
+    `runs.id` is a uuid column, so a malformed id makes Postgres raise on the way in
+    rather than returning no rows. Every caller reads that as "unknown run" and none of
+    them expect an exception, so the paid status service answered 500 to a buyer who had
+    already been charged, instead of the not_found it is written to return. An agent
+    marketplace reviewer probing with a placeholder id hits exactly that.
+
+    Guarded here rather than at the five call sites: all but the actor chain pass a
+    string that came from a request, and one of them forgetting the check is the same
+    bug again.
+    """
+    try:
+        uuid.UUID(run_id)
+    except (ValueError, TypeError, AttributeError):
+        return None
     with connection() as conn:
         return conn.execute("SELECT * FROM runs WHERE id = %s", (run_id,)).fetchone()
 

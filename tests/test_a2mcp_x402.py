@@ -159,6 +159,20 @@ def test_a_keyword_absent_from_both_is_a_400_not_a_422(configured, monkeypatch: 
     assert "keyword" in exc.value.detail
 
 
+def test_a_malformed_job_id_is_not_found_rather_than_a_server_error() -> None:
+    """Regression: the listing was rejected for "a server error". `runs.id` is a uuid
+    column, so a job_id that is not a uuid raised inside Postgres before the handler's
+    not_found branch could run, and a buyer who had already paid got a 500. Reviewers
+    probe with placeholder ids, so this is the first thing they hit.
+
+    No database is involved on purpose: reaching one at all would mean the guard did not
+    fire."""
+    from pipeline import repo
+
+    for junk in ("test", "123", "", "not-a-uuid", "402966f1-52f6-42b1-8999"):
+        assert repo.get_run(junk) is None
+
+
 def test_unconfigured_serves_no_paid_work(unconfigured, monkeypatch: pytest.MonkeyPatch) -> None:
     """The failure this whole arrangement exists to prevent. With no payment gate
     installed, a create call must NOT reach the pipeline -- an unconfigured deployment
